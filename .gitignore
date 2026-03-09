@@ -1,0 +1,38 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.opendb
+
+# Build folders
+Debug/
+Release/
+x64/
+x86/
+out/
+build/
+
+# C/C++
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.lib
+*.dll
+*.exp
+*.ipch
+*.tlog
+*.lastbuildstate
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+
+# vcpkg installed packages
+vcpkg_installed/
+
+# OS
+Thumbs.db
+.DS_Store

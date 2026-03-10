@@ -5,93 +5,85 @@
 
 #include "bitnet_weight.h"
 
-// ============================================================
-// BitNet I2S matmul entry points
-//
-// Forward:
-//   Uses forward-packed q2 + w_scale_tile
-//
-// Backward (Option C):
-//   Uses forward-packed q2 + w_scale_tile + bwd assist metadata
-//   No full q2T / w_scale_tileT are stored.
-// ============================================================
-
-
 // ------------------------------------------------------------
-// Forward: Y[T,H] += X[T,H] * W[H,H]
-//
-// W is BitNet I2S packed row-major.
-// Output accumulation semantics are additive.
+// linear_THH_bitnet_i2s_accum
 // ------------------------------------------------------------
-
+// Performs a forward linear layer computation: Y += X * W
+// X is quantized to int8 on the fly into x8Scratch. W is accessed 
+// in its 2-bit packed row-major format.
+// Results are accumulated additively into Y.
 void linear_THH_bitnet_i2s_accum(
-    float* __restrict Y,              // [T x H], row-major
-    const float* __restrict X,        // [T x H], row-major
+    float* __restrict Y,
+    const float* __restrict X,
     const BitNetMatI2S& W,
     std::size_t T,
     std::size_t H,
-    std::size_t tTile
+    std::size_t tTile,
+    int8_t* __restrict x8Scratch,
+    float* __restrict xScaleScratch
 );
 
-
 // ------------------------------------------------------------
-// Forward: fused QKV
-//
-// Q,K,V each receive:
-//   += X * W{q,k,v}
+// linear_THH_fused_qkv_bitnet_i2s_accum
 // ------------------------------------------------------------
-
+// Fused forward computation for Q, K, and V projections.
+// Reads input X once, quantizes it, and sequentially applies it to 
+// Wq, Wk, and Wv while the inputs remain hot in the L1 cache.
 void linear_THH_fused_qkv_bitnet_i2s_accum(
-    float* __restrict Q,              // [T x H]
-    float* __restrict K,              // [T x H]
-    float* __restrict V,              // [T x H]
-    const float* __restrict X,        // [T x H]
+    float* __restrict Q,
+    float* __restrict K,
+    float* __restrict V,
+    const float* __restrict X,
     const BitNetMatI2S& Wq,
     const BitNetMatI2S& Wk,
     const BitNetMatI2S& Wv,
     std::size_t T,
     std::size_t H,
-    std::size_t tTile
+    std::size_t tTile,
+    int8_t* __restrict x8Scratch,
+    float* __restrict xScaleScratch
 );
 
-
 // ------------------------------------------------------------
-// Backward input gradient: dX += dY * W^T
-//
-// Option C:
-//   Reads transpose-style weights directly from forward q2
-//   using W.bwd metadata.
+// linear_HH_T_bitnet_i2s_packed
 // ------------------------------------------------------------
-
-void linear_HH_T_bitnet_i2s_assisted_block32(
-    float* __restrict dX,             // [T x H]
-    const float* __restrict dY,       // [T x H]
+// Computes the backward pass input gradient: dX += dY * W^T
+// Utilizes the pre-transposed, packed 2-bit representation (q2T) 
+// and transposed scales (w_scale_tileT) generated during quantization 
+// to maintain dense, sequential memory access and full AVX2 vectorization.
+void linear_HH_T_bitnet_i2s_packed(
+    float* __restrict dX,
+    const float* __restrict dY,
     const BitNetMatI2S& W,
     std::size_t T,
     std::size_t H,
     std::size_t tTile,
-    std::size_t iTile
+    int8_t* __restrict dy8Scratch,
+    float* __restrict dyScaleScratch
 );
 
-
 // ------------------------------------------------------------
-// Backward input gradient for fused QKV:
-//
+// qkv_input_backward_bitnet_i2s_packed
+// ------------------------------------------------------------
+// Computes the fused backward pass input gradient for Q, K, and V:
 // dX += dQ * Wq^T + dK * Wk^T + dV * Wv^T
-//
-// Uses assisted transpose access from forward q2 buffers.
-// ------------------------------------------------------------
-
-void qkv_input_backward_bitnet_i2s_assisted(
-    float* __restrict dX,             // [T x H]
-    const float* __restrict dQ,       // [T x H]
-    const float* __restrict dK,       // [T x H]
-    const float* __restrict dV,       // [T x H]
+// Leverages transposed packed weights (q2T) for all three matrices 
+// to prevent structural memory bottlenecks during backpropagation.
+void qkv_input_backward_bitnet_i2s_packed(
+    float* __restrict dX,
+    const float* __restrict dQ,
+    const float* __restrict dK,
+    const float* __restrict dV,
     const BitNetMatI2S& Wq,
     const BitNetMatI2S& Wk,
     const BitNetMatI2S& Wv,
     std::size_t T,
     std::size_t H,
     std::size_t tTile,
-    std::size_t iTile
+    int8_t* __restrict dq8Scratch,
+    float* __restrict dqScaleScratch,
+    int8_t* __restrict dk8Scratch,
+    float* __restrict dkScaleScratch,
+    int8_t* __restrict dv8Scratch,
+    float* __restrict dvScaleScratch
 );

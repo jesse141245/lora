@@ -125,7 +125,8 @@ void quantize_ternary_i2s_blockwise(
     out.jq = jq;
     out.q2.clear();
     out.w_scale_tile.assign(nJBlocks * nKBlocks, 1.0f);
-    out.bwd.clear();
+    out.q2T.clear();
+    out.w_scale_tileT.clear();
 
     std::vector<int8_t> q(N, 0);
 
@@ -172,10 +173,8 @@ void quantize_ternary_i2s_blockwise(
 
     pack_ternary_to_2bit(out.q2, q.data(), N);
 
-    // Default backward assist tile for Option C.
-    out.bwd.ib = 32;
-    out.bwd.jb = 32;
-    build_bitnet_i2s_backward_assist(out);
+    // Build the transposed view for the backward pass
+    build_bitnet_i2s_transposed_view(out);
 }
 
 // ============================================================

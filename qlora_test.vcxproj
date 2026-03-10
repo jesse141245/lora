@@ -128,6 +128,8 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
+      <FloatingPointModel>Fast</FloatingPointModel>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -141,10 +143,15 @@
     <ClCompile Include="bitnet_i2_s.cpp" />
     <ClCompile Include="bitnet_quant.cpp" />
     <ClCompile Include="bitnet_weight.cpp" />
-    <ClCompile Include="cpuKernelBack.cpp" />
+    <ClCompile Include="checkpoint.cpp" />
+    <ClCompile Include="cpuKernelBack.cpp">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="dataset.cpp" />
     <ClCompile Include="kernels.cpp" />
     <ClCompile Include="lion_optimizer.cpp" />
     <ClCompile Include="lora_io.cpp" />
+    <ClCompile Include="loss_ce.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="qlora_cpu.cpp">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
@@ -156,12 +163,17 @@
     <ClInclude Include="bitnet_i2_s.h" />
     <ClInclude Include="bitnet_quant.h" />
     <ClInclude Include="bitnet_weight.h" />
+    <ClInclude Include="checkpoint.h" />
     <ClInclude Include="config.h" />
-    <ClInclude Include="cpuKernelBack.h" />
+    <ClInclude Include="cpuKernelBack.h">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+    </ClInclude>
+    <ClInclude Include="dataset.h" />
     <ClInclude Include="kernels.h" />
     <ClInclude Include="lion_optimizer.h" />
     <ClInclude Include="lora_io.h" />
     <ClInclude Include="lora_type.h" />
+    <ClInclude Include="loss_ce.h" />
     <ClInclude Include="optimizer.h" />
     <ClInclude Include="modelShape.h" />
     <ClInclude Include="paramRef.h" />

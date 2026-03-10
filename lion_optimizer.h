@@ -13,10 +13,10 @@ public:
 
     void init(const std::vector<ParamRef>& params);
 
-    // Clips global L2 norm of grads across all params to maxNorm (if maxNorm <= 0: no-op)
+    // Clips global L2 norm of grads across all params to maxNorm
     void clipGradNorm(const std::vector<ParamRef>& params, float maxNorm);
 
-    // Applies Lion update to ALL params in-place. Optionally zeros grads.
+    // Applies Lion update to all params in-place
     void step(const std::vector<ParamRef>& params, bool zeroGrads = true);
 
 private:
@@ -25,6 +25,5 @@ private:
     float beta2_ = 0.99f;
     float weightDecay_ = 0.0f;
 
-    // momentum buffers: one per ParamRef, same length p.n
     std::vector<std::vector<float>> m_;
 };

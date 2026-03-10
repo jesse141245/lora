@@ -4,145 +4,78 @@
 #include <cstdint>
 #include <vector>
 
-// ============================================================
-// BitNet I2S utilities
-//
-// I2S = int2 weights + int8 activations
-//
-// Weight encoding:
-//   00 = -1
-//   01 =  0
-//   10 = +1
-//   11 = unused
-// ============================================================
-
-
-// ------------------------------------------------------------
-// Ternary encoding helpers
-// ------------------------------------------------------------
-
-inline uint8_t ternary_to_i2_code(int8_t q) noexcept
-{
-    return (q == -1) ? 0u :
-        (q == 0) ? 1u :
-        2u;
+inline uint8_t ternary_to_i2_code(int8_t q) noexcept {
+    return (q == -1) ? 0u : (q == 0) ? 1u : 2u;
 }
 
-inline int8_t i2_code_to_ternary(uint8_t code) noexcept
-{
+inline int8_t i2_code_to_ternary(uint8_t code) noexcept {
     code &= 0x3u;
-
     if (code == 0u) return -1;
-    if (code == 1u) return  0;
+    if (code == 1u) return 0;
     if (code == 2u) return +1;
     return 0;
 }
 
+// ------------------------------------------------------------
+// pack_ternary_to_2bit
+// ------------------------------------------------------------
+// Packs an array of ternary values (-1, 0, 1) into a dense 2-bit 
+// byte array. 4 weights are stored per byte to reduce memory footprint.
+void pack_ternary_to_2bit(std::vector<uint8_t>& out_q2, const int8_t* q, std::size_t N);
 
 // ------------------------------------------------------------
-// Pack / unpack
+// unpack_2bit_to_ternary
 // ------------------------------------------------------------
-
-void pack_ternary_to_2bit(
-    std::vector<uint8_t>& out_q2,
-    const int8_t* q,
-    std::size_t N
-);
-
-void unpack_2bit_to_ternary(
-    std::vector<int8_t>& out_q,
-    const uint8_t* q2,
-    std::size_t N
-);
-
+// Decodes a dense 2-bit byte array back into standard int8_t 
+// ternary values (-1, 0, 1).
+void unpack_2bit_to_ternary(std::vector<int8_t>& out_q, const uint8_t* q2, std::size_t N);
 
 // ------------------------------------------------------------
-// Activation quantization
-//
-// Quantizes X[t,h] into int8 tiles.
-//
-// xScale layout:
-//   xScale[tb * nHBlocks + kb]
-//
-// where:
-//   tb = tile over token rows
-//   kb = tile over hidden/K dimension
+// quantize_x_tile_i8_tiled
 // ------------------------------------------------------------
-
+// Dynamically quantizes a floating-point input activation matrix 
+// tile into int8_t. Computes and stores the absolute maximum scale 
+// for each block to allow symmetric integer dot products.
 void quantize_x_tile_i8_tiled(
-    int8_t* __restrict Xi8,
-    float* __restrict xScale,
-    const float* __restrict X,
-    std::size_t T,
-    std::size_t H,
-    std::size_t t0,
-    std::size_t tCount,
-    std::size_t tBlock,
-    std::size_t hBlock
+    int8_t* __restrict Xi8, float* __restrict xScale, const float* __restrict X,
+    std::size_t T, std::size_t H, std::size_t t0, std::size_t tCount,
+    std::size_t tBlock, std::size_t hBlock
 );
 
-
 // ------------------------------------------------------------
-// Core I2S dot kernel
-//
-// Computes one 32-column output tile:
-//
-//   acc32[jj] += sum_di W[i0+di, j0+jj] * x8[di]
-//
-// Requirements:
-//   - j0 must be multiple of 32
-//   - hCount is the active K span
+// dot_i2s_i8_accum_i32_block32
 // ------------------------------------------------------------
-
+// Computes the dot product of 1 row of int8 activations 
+// against a 32-column block of 2-bit packed weights.
 void dot_i2s_i8_accum_i32_block32(
-    int32_t* __restrict acc32,
-    const uint8_t* __restrict Wq2,
-    std::size_t H,
-    std::size_t i0,
-    std::size_t hCount,
-    const int8_t* __restrict x8,
+    int32_t* __restrict acc32, const uint8_t* __restrict Wq2, std::size_t H,
+    std::size_t i0, std::size_t hCount, const int8_t* __restrict x8, std::size_t j0
+);
+
+// ------------------------------------------------------------
+// dot_i2s_i8_accum_i32_block32_x2
+// ------------------------------------------------------------
+// Computes the dot product of 2 rows of int8 activations 
+// against a 32-column block of 2-bit packed weights simultaneously,
+// maximizing weight-decode reuse.
+void dot_i2s_i8_accum_i32_block32_x2(
+    int32_t* __restrict accA, int32_t* __restrict accB, const uint8_t* __restrict Wq2,
+    std::size_t H, std::size_t i0, std::size_t hCount,
+    const int8_t* __restrict x8A, const int8_t* __restrict x8B, std::size_t j0
+);
+
+// ------------------------------------------------------------
+// dot_i2s_i8_accum_i32_block32_x4
+// ------------------------------------------------------------
+// High-throughput micro-kernel. Computes the dot product of 4 rows 
+// of int8 activations against a 32-column block of 2-bit packed weights. 
+// Splits the 32 columns into two 16-column passes internally to perfectly 
+// utilize the 16 AVX2 vector registers and prevent memory spilling.
+void dot_i2s_i8_accum_i32_block32_x4(
+    int32_t* __restrict accA, int32_t* __restrict accB,
+    int32_t* __restrict accC, int32_t* __restrict accD,
+    const uint8_t* __restrict Wq2, std::size_t H, std::size_t i0, std::size_t hCount,
+    const int8_t* __restrict x8A, const int8_t* __restrict x8B,
+    const int8_t* __restrict x8C, const int8_t* __restrict x8D,
     std::size_t j0
 );
-
-
-// ------------------------------------------------------------
-// Packed-load helpers for Option C backward assist
-//
-// These helpers allow a backward kernel to read transpose-style
-// weights directly from the forward-packed q2 buffer using
-// precomputed metadata.
-//
-// q2 packs 4 weights per byte:
-//
-//   bits 0-1 : element 0
-//   bits 2-3 : element 1
-//   bits 4-5 : element 2
-//   bits 6-7 : element 3
-// ------------------------------------------------------------
-
-inline uint8_t bitnet_i2s_load_code(
-    const uint8_t* q2,
-    std::size_t byteIdx,
-    uint8_t shift) noexcept
-{
-    return static_cast<uint8_t>((q2[byteIdx] >> shift) & 0x3u);
-}
-
-inline int8_t bitnet_i2s_load_value(
-    const uint8_t* q2,
-    std::size_t byteIdx,
-    uint8_t shift) noexcept
-{
-    return i2_code_to_ternary(bitnet_i2s_load_code(q2, byteIdx, shift));
-}
-
-inline int8_t bitnet_i2s_load_from_assist(
-    const uint8_t* q2,
-    const uint32_t* byteIndex,
-    const uint8_t* bitShift,
-    std::size_t t) noexcept
-{
-    return i2_code_to_ternary(
-        static_cast<uint8_t>((q2[byteIndex[t]] >> bitShift[t]) & 0x3u)
-    );
-}

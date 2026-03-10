@@ -128,12 +128,6 @@ namespace {
         }
     }
 
-    static inline std::size_t bitnet_bwd_iTile(std::size_t H)
-    {
-        (void)H;
-        return 32;
-    }
-
 } // namespace
 
 ModelShape CpuKernelBackend::loadShapeFromConfig(const std::string& modelPath)
@@ -255,26 +249,10 @@ CpuKernelBackend::CpuKernelBackend(TrainerConfig cfg)
                 quantize_ternary_i2s_blockwise(layers_[L].Wq_q, layers_[L].Wq.data(), H, qk, jq);
                 quantize_ternary_i2s_blockwise(layers_[L].Wk_q, layers_[L].Wk.data(), H, qk, jq);
                 quantize_ternary_i2s_blockwise(layers_[L].Wv_q, layers_[L].Wv.data(), H, qk, jq);
-
-                layers_[L].Wq_q.bwd.ib = 32;
-                layers_[L].Wq_q.bwd.jb = 32;
-                build_bitnet_i2s_backward_assist(layers_[L].Wq_q);
-
-                layers_[L].Wk_q.bwd.ib = 32;
-                layers_[L].Wk_q.bwd.jb = 32;
-                build_bitnet_i2s_backward_assist(layers_[L].Wk_q);
-
-                layers_[L].Wv_q.bwd.ib = 32;
-                layers_[L].Wv_q.bwd.jb = 32;
-                build_bitnet_i2s_backward_assist(layers_[L].Wv_q);
             }
 
             if (cfg_.bitnetQuantizeWo) {
                 quantize_ternary_i2s_blockwise(layers_[L].Wo_q, layers_[L].Wo.data(), H, qk, jq);
-
-                layers_[L].Wo_q.bwd.ib = 32;
-                layers_[L].Wo_q.bwd.jb = 32;
-                build_bitnet_i2s_backward_assist(layers_[L].Wo_q);
             }
         }
 
@@ -349,12 +327,18 @@ void CpuKernelBackend::forward(
             std::fill(k_.begin(), k_.begin() + (T * H), 0.0f);
             std::fill(v_.begin(), v_.begin() + (T * H), 0.0f);
 
+            const std::size_t nXBlocks = (H + layers_[L].Wq_q.qk - 1) / layers_[L].Wq_q.qk;
+            std::vector<int8_t> x8Scratch(tTile * H);
+            std::vector<float> xScaleScratch(tTile * nXBlocks);
+
             linear_THH_fused_qkv_bitnet_i2s_accum(
                 q_.data(), k_.data(), v_.data(),
                 xnorm_.data(),
                 layers_[L].Wq_q, layers_[L].Wk_q, layers_[L].Wv_q,
                 T, H,
-                tTile
+                tTile,
+                x8Scratch.data(),
+                xScaleScratch.data()
             );
         }
         else {
@@ -399,12 +383,18 @@ void CpuKernelBackend::forward(
         if (useI2SWo) {
             std::fill(attn_.begin(), attn_.begin() + (T * H), 0.0f);
 
+            const std::size_t nXBlocks = (H + layers_[L].Wo_q.qk - 1) / layers_[L].Wo_q.qk;
+            std::vector<int8_t> x8Scratch(tTile * H);
+            std::vector<float> xScaleScratch(tTile * nXBlocks);
+
             linear_THH_bitnet_i2s_accum(
                 attn_.data(),
                 ctx_.data(),
                 layers_[L].Wo_q,
                 T, H,
-                tTile
+                tTile,
+                x8Scratch.data(),
+                xScaleScratch.data()
             );
         }
         else {
@@ -539,12 +529,18 @@ void CpuKernelBackend::backward(
             std::fill(k_.begin(), k_.begin() + (T * H), 0.0f);
             std::fill(v_.begin(), v_.begin() + (T * H), 0.0f);
 
+            const std::size_t nXBlocks = (H + layers_[L].Wq_q.qk - 1) / layers_[L].Wq_q.qk;
+            std::vector<int8_t> x8Scratch(tTile * H);
+            std::vector<float> xScaleScratch(tTile * nXBlocks);
+
             linear_THH_fused_qkv_bitnet_i2s_accum(
                 q_.data(), k_.data(), v_.data(),
                 xnorm_.data(),
                 layers_[L].Wq_q, layers_[L].Wk_q, layers_[L].Wv_q,
                 T, H,
-                tTile
+                tTile,
+                x8Scratch.data(),
+                xScaleScratch.data()
             );
         }
         else {
@@ -592,8 +588,14 @@ void CpuKernelBackend::backward(
         if (useI2SWo) {
             std::fill(attn_.begin(), attn_.begin() + (T * H), 0.0f);
 
+            const std::size_t nXBlocks = (H + layers_[L].Wo_q.qk - 1) / layers_[L].Wo_q.qk;
+            std::vector<int8_t> x8Scratch(tTile * H);
+            std::vector<float> xScaleScratch(tTile * nXBlocks);
+
             linear_THH_bitnet_i2s_accum(
-                attn_.data(), ctx_.data(), layers_[L].Wo_q, T, H, tTile
+                attn_.data(), ctx_.data(), layers_[L].Wo_q, T, H, tTile,
+                x8Scratch.data(),
+                xScaleScratch.data()
             );
         }
         else {
@@ -610,13 +612,18 @@ void CpuKernelBackend::backward(
         }
 
         if (useI2SWo) {
-            linear_HH_T_bitnet_i2s_assisted_block32(
+            const std::size_t nYBlocks = (H + layers_[L].Wo_q.jq - 1) / layers_[L].Wo_q.jq;
+            std::vector<int8_t> dy8Scratch(tTile * H);
+            std::vector<float> dyScaleScratch(tTile * nYBlocks);
+
+            linear_HH_T_bitnet_i2s_packed(
                 dCtx_.data(),
                 dAttn_.data(),
                 layers_[L].Wo_q,
                 T, H,
                 tTile,
-                bitnet_bwd_iTile(H)
+                dy8Scratch.data(),
+                dyScaleScratch.data()
             );
         }
         else {
@@ -725,13 +732,26 @@ void CpuKernelBackend::backward(
         }
 
         if (useI2SQKV) {
-            qkv_input_backward_bitnet_i2s_assisted(
+            const std::size_t nQBlocks = (H + layers_[L].Wq_q.jq - 1) / layers_[L].Wq_q.jq;
+            const std::size_t nKBlocks = (H + layers_[L].Wk_q.jq - 1) / layers_[L].Wk_q.jq;
+            const std::size_t nVBlocks = (H + layers_[L].Wv_q.jq - 1) / layers_[L].Wv_q.jq;
+
+            std::vector<int8_t> dq8Scratch(tTile * H);
+            std::vector<float> dqScaleScratch(tTile * nQBlocks);
+            std::vector<int8_t> dk8Scratch(tTile * H);
+            std::vector<float> dkScaleScratch(tTile * nKBlocks);
+            std::vector<int8_t> dv8Scratch(tTile * H);
+            std::vector<float> dvScaleScratch(tTile * nVBlocks);
+
+            qkv_input_backward_bitnet_i2s_packed(
                 dXnorm_.data(),
                 dQ_.data(), dK_.data(), dV_.data(),
                 layers_[L].Wq_q, layers_[L].Wk_q, layers_[L].Wv_q,
                 T, H,
                 tTile,
-                bitnet_bwd_iTile(H)
+                dq8Scratch.data(), dqScaleScratch.data(),
+                dk8Scratch.data(), dkScaleScratch.data(),
+                dv8Scratch.data(), dvScaleScratch.data()
             );
         }
         else {

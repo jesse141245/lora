@@ -1,4 +1,4 @@
-#include "lion_optimizer.h"
+﻿#include "lion_optimizer.h"
 
 #include <algorithm>
 #include <cmath>
@@ -29,6 +29,15 @@ namespace {
 
 void LionOptimizer::init(const std::vector<ParamRef>& params)
 {
+    // SAFEGUARD: If already initialized to the exact right shape (e.g. via checkpoint), do not wipe.
+    if (m_.size() == params.size()) {
+        bool match = true;
+        for (std::size_t i = 0; i < params.size(); ++i) {
+            if (m_[i].size() != params[i].n) match = false;
+        }
+        if (match) return;
+    }
+
     m_.clear();
     m_.reserve(params.size());
 
@@ -111,6 +120,10 @@ void LionOptimizer::step(const std::vector<ParamRef>& params, bool zeroGrads)
         throw std::runtime_error("LionOptimizer::step: params size changed; call init() again");
     }
 
+    // FIX: Use |lr| so the sign-OR trick in AVX2 is always correct,
+    // even if a caller accidentally passes a negative learning rate.
+    const float lr_abs = std::abs(lr_);
+
     for (std::size_t k = 0; k < params.size(); ++k) {
         float* w = params[k].w;
         float* g = params[k].g;
@@ -127,17 +140,18 @@ void LionOptimizer::step(const std::vector<ParamRef>& params, bool zeroGrads)
         const __m256 beta2v = _mm256_set1_ps(beta2_);
         const __m256 one_mb2v = _mm256_set1_ps(1.0f - beta2_);
         const __m256 wdv = _mm256_set1_ps(weightDecay_);
-        const __m256 lrv = _mm256_set1_ps(lr_);
+        const __m256 lrv = _mm256_set1_ps(lr_abs);  // always positive magnitude
 
-        // sign mask for float lanes: keep only sign bit from u
+        // Mask that isolates the IEEE-754 sign bit of each float lane.
         const __m256 signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x80000000));
 
         std::size_t i = 0;
         for (; i + 8 <= n; i += 8) {
             __m256 wv = _mm256_loadu_ps(w + i);
             __m256 gv = _mm256_loadu_ps(g + i);
-            __m256 mv = _mm256_loadu_ps(m.data() + i);
+            __m256 mv = _mm256_loadu_ps(m.data() + i);  // m_old
 
+            // ── 1. Weight-decayed gradient ───────────────────────────────────
             // grad = g + weightDecay * w
 #if defined(__FMA__)
             __m256 grad = _mm256_fmadd_ps(wdv, wv, gv);
@@ -145,25 +159,34 @@ void LionOptimizer::step(const std::vector<ParamRef>& params, bool zeroGrads)
             __m256 grad = _mm256_add_ps(gv, _mm256_mul_ps(wdv, wv));
 #endif
 
-            // m = beta1*m + (1-beta1)*grad
+            // ── 2. FIX: compute u from m_OLD, THEN update m ──────────────────
+            //
+            // Lion paper Algorithm 1 (Chen et al., 2023):
+            //   Line 6:  u = β2·m + (1−β2)·grad       ← uses m BEFORE update
+            //   Line 7:  m ← β1·m + (1−β1)·grad       ← update happens AFTER
+            //   Line 8:  w ← w − lr·sign(u)
+            //
+            // The old code updated mv first then computed uv from the new mv,
+            // introducing a one-step lag that made the optimizer less stable.
+
+            // u = β2·m_old + (1−β2)·grad
+            __m256 uv = _mm256_add_ps(
+                _mm256_mul_ps(beta2v, mv),
+                _mm256_mul_ps(one_mb2v, grad)
+            );
+
+            // m ← β1·m_old + (1−β1)·grad
             mv = _mm256_add_ps(
                 _mm256_mul_ps(beta1v, mv),
                 _mm256_mul_ps(one_mb1v, grad)
             );
             _mm256_storeu_ps(m.data() + i, mv);
 
-            // u = beta2*m + (1-beta2)*grad
-            __m256 uv = _mm256_add_ps(
-                _mm256_mul_ps(beta2v, mv),
-                _mm256_mul_ps(one_mb2v, grad)
-            );
-
-            // step = copysign(lr, u)
-            // preserve sign bit from u, magnitude from lr
+            // ── 3. Weight update: w -= copysign(|lr|, u) ────────────────────
+            // Extract sign bit from u and OR it onto the positive lr magnitude.
             __m256 signbits = _mm256_and_ps(uv, signmask);
             __m256 stepv = _mm256_or_ps(lrv, signbits);
 
-            // w -= copysign(lr, u)
             wv = _mm256_sub_ps(wv, stepv);
             _mm256_storeu_ps(w + i, wv);
 
@@ -172,19 +195,24 @@ void LionOptimizer::step(const std::vector<ParamRef>& params, bool zeroGrads)
             }
         }
 
+        // ── Scalar tail (handles n % 8 remainder) ───────────────────────────
         for (; i < n; ++i) {
             const float grad = g[i] + weightDecay_ * w[i];
-            m[i] = beta1_ * m[i] + (1.0f - beta1_) * grad;
+            // u uses m_old — same order as AVX2 path above
             const float u = beta2_ * m[i] + (1.0f - beta2_) * grad;
-            w[i] -= std::copysign(lr_, u);
+            m[i] = beta1_ * m[i] + (1.0f - beta1_) * grad;
+            w[i] -= std::copysign(lr_abs, u);
             if (zeroGrads) g[i] = 0.0f;
         }
-#else
+
+#else  // ── Pure scalar fallback (no AVX2) ───────────────────────────────────
+
         for (std::size_t i = 0; i < n; ++i) {
             const float grad = g[i] + weightDecay_ * w[i];
-            m[i] = beta1_ * m[i] + (1.0f - beta1_) * grad;
+            // u uses m_old
             const float u = beta2_ * m[i] + (1.0f - beta2_) * grad;
-            w[i] -= std::copysign(lr_, u);
+            m[i] = beta1_ * m[i] + (1.0f - beta1_) * grad;
+            w[i] -= std::copysign(lr_abs, u);
             if (zeroGrads) g[i] = 0.0f;
         }
 #endif

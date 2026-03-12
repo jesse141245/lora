@@ -23,8 +23,8 @@ struct TrainerConfig {
     // Model info (logging / UI only)
     // Source of truth should be ModelShape loaded from modelPath/config.json
     // ============================================================
-    int vocabSize = 0;
-    int hiddenSize = 0;
+    int vocabSize = 128256;
+    int hiddenSize = 2560;
     int nLayers = 0;
     int nHeads = 0;
 
@@ -60,7 +60,7 @@ struct TrainerConfig {
     std::size_t iTile = 32;
 
     std::size_t loraRank = 8;
-    float loraAlpha = 16.0f;
+    float loraAlpha = 8.0f;
     float loraDropout = 0.0f;
     std::vector<std::string> loraTargets; // e.g. {"attn.q", "attn.v"}
     bool freezeBase = true;

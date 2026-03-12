@@ -48,7 +48,7 @@ void quantize_x_tile_i8_tiled(
 // Computes the dot product of 1 row of int8 activations 
 // against a 32-column block of 2-bit packed weights.
 void dot_i2s_i8_accum_i32_block32(
-    int32_t* __restrict acc32, const uint8_t* __restrict Wq2, std::size_t H,
+    int32_t* __restrict acc32, const uint8_t* __restrict Wq2, std::size_t stride_cols,
     std::size_t i0, std::size_t hCount, const int8_t* __restrict x8, std::size_t j0
 );
 
@@ -60,7 +60,7 @@ void dot_i2s_i8_accum_i32_block32(
 // maximizing weight-decode reuse.
 void dot_i2s_i8_accum_i32_block32_x2(
     int32_t* __restrict accA, int32_t* __restrict accB, const uint8_t* __restrict Wq2,
-    std::size_t H, std::size_t i0, std::size_t hCount,
+    std::size_t stride_cols, std::size_t i0, std::size_t hCount,
     const int8_t* __restrict x8A, const int8_t* __restrict x8B, std::size_t j0
 );
 
@@ -74,7 +74,7 @@ void dot_i2s_i8_accum_i32_block32_x2(
 void dot_i2s_i8_accum_i32_block32_x4(
     int32_t* __restrict accA, int32_t* __restrict accB,
     int32_t* __restrict accC, int32_t* __restrict accD,
-    const uint8_t* __restrict Wq2, std::size_t H, std::size_t i0, std::size_t hCount,
+    const uint8_t* __restrict Wq2, std::size_t stride_cols, std::size_t i0, std::size_t hCount,
     const int8_t* __restrict x8A, const int8_t* __restrict x8B,
     const int8_t* __restrict x8C, const int8_t* __restrict x8D,
     std::size_t j0

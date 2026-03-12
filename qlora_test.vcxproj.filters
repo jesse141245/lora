@@ -33,9 +33,6 @@
     <ClCompile Include="lora_io.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="bench.h">
-      <Filter>Header Files</Filter>
-    </ClCompile>
     <ClCompile Include="main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -116,5 +113,11 @@
     <ClInclude Include="checkpoint.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="download.py" />
+    <None Include="tokenize_data.py" />
+    <None Include="run.py" />
+    <None Include="my_raw_data.jsonl" />
   </ItemGroup>
 </Project>

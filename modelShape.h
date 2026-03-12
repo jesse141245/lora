@@ -7,5 +7,6 @@ struct ModelShape {
     std::size_t nLayers;
     std::size_t nHeads;
 
+    std::size_t nKvHeads;
     std::size_t headDim() const { return hiddenSize / nHeads; }
 };

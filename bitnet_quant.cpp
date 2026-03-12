@@ -96,87 +96,60 @@ void quantize_ternary_blockwise(
 void quantize_ternary_i2s_blockwise(
     BitNetMatI2S& out,
     const float* W,
-    std::size_t H,
+    std::size_t rows,
+    std::size_t cols,
     std::size_t qk,
     std::size_t jq)
 {
-    if (!W) {
-        throw std::runtime_error("quantize_ternary_i2s_blockwise: W is null");
-    }
-    if (H == 0) {
-        throw std::runtime_error("quantize_ternary_i2s_blockwise: H == 0");
-    }
-    if (qk == 0) {
-        throw std::runtime_error("quantize_ternary_i2s_blockwise: qk == 0");
-    }
-    if (jq == 0) {
-        throw std::runtime_error("quantize_ternary_i2s_blockwise: jq == 0");
-    }
-    if ((jq % 32) != 0) {
-        throw std::runtime_error("quantize_ternary_i2s_blockwise: jq must be multiple of 32");
-    }
+    if (!W) throw std::runtime_error("quantize_ternary_i2s_blockwise: W null");
+    if (rows == 0 || cols == 0) throw std::runtime_error("quantize_ternary_i2s_blockwise: Zero dim");
+    if ((cols % 32) != 0) throw std::runtime_error("quantize_ternary_i2s_blockwise: cols must be multiple of 32");
 
-    const std::size_t N = H * H;
-    const std::size_t nKBlocks = (H + qk - 1) / qk;
-    const std::size_t nJBlocks = (H + jq - 1) / jq;
+    const std::size_t N = rows * cols;
+    const std::size_t nKBlocks = (rows + qk - 1) / qk;
+    const std::size_t nJBlocks = (cols + jq - 1) / jq;
 
-    out.H = H;
+    out.rows = rows;
+    out.cols = cols;
     out.qk = qk;
     out.jq = jq;
     out.q2.clear();
     out.w_scale_tile.assign(nJBlocks * nKBlocks, 1.0f);
-    out.q2T.clear();
-    out.w_scale_tileT.clear();
 
     std::vector<int8_t> q(N, 0);
 
     for (std::size_t jb = 0; jb < nJBlocks; ++jb) {
         const std::size_t j0 = jb * jq;
-        const std::size_t j1 = std::min(H, j0 + jq);
+        const std::size_t j1 = std::min(cols, j0 + jq);
 
         for (std::size_t kb = 0; kb < nKBlocks; ++kb) {
             const std::size_t i0 = kb * qk;
-            const std::size_t i1 = std::min(H, i0 + qk);
+            const std::size_t i1 = std::min(rows, i0 + qk);
 
             float amax = 0.0f;
             for (std::size_t i = i0; i < i1; ++i) {
                 for (std::size_t j = j0; j < j1; ++j) {
-                    amax = std::max(amax, std::abs(W[i * H + j]));
+                    amax = std::max(amax, std::abs(W[i * cols + j]));
                 }
             }
 
             const float s = (amax > 0.0f) ? amax : 1.0f;
             out.w_scale_tile[jb * nKBlocks + kb] = s;
-
             const float inv_s = 1.0f / s;
 
             for (std::size_t i = i0; i < i1; ++i) {
                 for (std::size_t j = j0; j < j1; ++j) {
-                    const float v = W[i * H + j] * inv_s;
-
-                    int qi;
-                    if (v > 0.5f) {
-                        qi = 1;
-                    }
-                    else if (v < -0.5f) {
-                        qi = -1;
-                    }
-                    else {
-                        qi = 0;
-                    }
-
-                    q[i * H + j] = static_cast<int8_t>(qi);
+                    const float v = W[i * cols + j] * inv_s;
+                    int qi = (v > 0.5f) ? 1 : (v < -0.5f) ? -1 : 0;
+                    q[i * cols + j] = static_cast<int8_t>(qi);
                 }
             }
         }
     }
 
     pack_ternary_to_2bit(out.q2, q.data(), N);
-
-    // Build the transposed view for the backward pass
     build_bitnet_i2s_transposed_view(out);
 }
-
 // ============================================================
 // Legacy dequantization
 // ============================================================

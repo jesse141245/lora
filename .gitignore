@@ -36,3 +36,33 @@ vcpkg_installed/
 # OS
 Thumbs.db
 .DS_Store
+
+# ======================================================
+# Python & Virtual Environments
+# ======================================================
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+bitnet_env/
+
+# ======================================================
+# Machine Learning / Model Weights
+# ======================================================
+*.bin
+*.safetensors
+test_model/
+checkpoints/
+lora_output.bin
+
+# ======================================================
+# Datasets
+# ======================================================
+*.jsonl
+*.csv
+dataset/
+data/
+
+# Hugging Face / Transformers cache (if downloaded locally)
+.cache/

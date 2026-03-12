@@ -227,14 +227,18 @@ void dot_i2s_i8_accum_i32_block32_x2(
 void dot_i2s_i8_accum_i32_block32_x4(
     int32_t* __restrict accA, int32_t* __restrict accB,
     int32_t* __restrict accC, int32_t* __restrict accD,
-    const uint8_t* __restrict Wq2, std::size_t H, std::size_t i0, std::size_t hCount,
+    const uint8_t* __restrict Wq2, std::size_t stride_cols, std::size_t i0, std::size_t hCount,
     const int8_t* __restrict x8A, const int8_t* __restrict x8B,
-    const int8_t* __restrict x8C, const int8_t* __restrict x8D, std::size_t j0)
+    const int8_t* __restrict x8C, const int8_t* __restrict x8D, std::size_t j0) 
 {
 #if defined(__AVX2__)
     const __m256i shift_vec = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
     const __m256i mask_vec = _mm256_set1_epi32(3);
     const __m256i one_vec = _mm256_set1_epi32(1);
+
+    // stride_cols elements = (stride_cols / 4) bytes. 
+    // Jumping 4 rows ahead is EXACTLY +stride_cols in bytes!
+    const std::size_t prefetch_stride = stride_cols;
 
     // --- HALF 1: Columns 0 to 15 ---
     {
@@ -250,10 +254,8 @@ void dot_i2s_i8_accum_i32_block32_x4(
         for (std::size_t di = 0; di < hCount; ++di) {
             if (!(x8A[di] | x8B[di] | x8C[di] | x8D[di])) continue;
 
-            const uint8_t* wbytes = Wq2 + (((i0 + di) * H + j0) >> 2);
-
-            // Prefetch weights 4 rows ahead to hide L1 cache miss latency
-            _mm_prefetch(reinterpret_cast<const char*>(wbytes + H), _MM_HINT_T0);
+            const uint8_t* wbytes = Wq2 + (((i0 + di) * stride_cols + j0) >> 2);
+            _mm_prefetch(reinterpret_cast<const char*>(wbytes + prefetch_stride), _MM_HINT_T0);
 
             __m256 w0 = decode_2bytes_to_ps(wbytes + 0, shift_vec, mask_vec, one_vec);
             __m256 w1 = decode_2bytes_to_ps(wbytes + 2, shift_vec, mask_vec, one_vec);
@@ -283,10 +285,9 @@ void dot_i2s_i8_accum_i32_block32_x4(
         for (std::size_t di = 0; di < hCount; ++di) {
             if (!(x8A[di] | x8B[di] | x8C[di] | x8D[di])) continue;
 
-            const uint8_t* wbytes = Wq2 + (((i0 + di) * H + j0) >> 2);
+            const uint8_t* wbytes = Wq2 + (((i0 + di) * stride_cols + j0) >> 2);
 
-            // Prefetch weights 4 rows ahead
-            _mm_prefetch(reinterpret_cast<const char*>(wbytes + H), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(wbytes + prefetch_stride), _MM_HINT_T0);
 
             __m256 w2 = decode_2bytes_to_ps(wbytes + 4, shift_vec, mask_vec, one_vec);
             __m256 w3 = decode_2bytes_to_ps(wbytes + 6, shift_vec, mask_vec, one_vec);

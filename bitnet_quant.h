@@ -29,9 +29,9 @@
 // Legacy quantization: float matrix -> ternary blockwise BitNetMat
 // ------------------------------------------------------------
 void quantize_ternary_blockwise(
-    BitNetMat& out,
-    const float* W,
-    std::size_t H,
+    BitNetMat& out, 
+    const float* W, 
+    std::size_t H, 
     std::size_t block
 );
 
@@ -66,7 +66,8 @@ void quantize_ternary_blockwise(
 void quantize_ternary_i2s_blockwise(
     BitNetMatI2S& out,
     const float* W,
-    std::size_t H,
+    std::size_t rows,
+    std::size_t cols,
     std::size_t qk,
     std::size_t jq
 );
@@ -76,7 +77,7 @@ void quantize_ternary_i2s_blockwise(
 // Legacy dequantization helper: BitNetMat -> float matrix
 // ------------------------------------------------------------
 void dequant_to_float(
-    float* Wout,
+    float* Wout, 
     const BitNetMat& Wq
 );
 
@@ -85,12 +86,12 @@ void dequant_to_float(
 // Legacy AVX helpers for old BitNetMat path
 // ------------------------------------------------------------
 __m256 bitnet_dequant8_ps(
-    const BitNetMat& M,
+    const BitNetMat& M, 
     std::size_t idx0
 );
 
 __m256 bitnet_dequant8_ps_twoScale(
-    const BitNetMat& M,
+    const BitNetMat& M, 
     std::size_t idx0
 );
 

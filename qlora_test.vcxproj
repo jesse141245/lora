@@ -49,7 +49,7 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v143</PlatformToolset>
+    <PlatformToolset>ClangCL</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -130,22 +130,25 @@
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
+      <OpenMPSupport>true</OpenMPSupport>
+      <AdditionalOptions> /openmp /fp:fast /clang:-O3 /clang:-ffast-math /clang:-march=znver4</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
+      <AdditionalDependencies>libomp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="attention.cpp" />
-    <ClCompile Include="bench.h" />
     <ClCompile Include="bitnet_i2s_matmul.cpp" />
     <ClCompile Include="bitnet_i2_s.cpp" />
     <ClCompile Include="bitnet_quant.cpp" />
     <ClCompile Include="bitnet_weight.cpp" />
     <ClCompile Include="checkpoint.cpp" />
     <ClCompile Include="cpuKernelBack.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="dataset.cpp" />
     <ClCompile Include="kernels.cpp" />
@@ -166,7 +169,7 @@
     <ClInclude Include="checkpoint.h" />
     <ClInclude Include="config.h" />
     <ClInclude Include="cpuKernelBack.h">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ExcludedFromBuild>
     </ClInclude>
     <ClInclude Include="dataset.h" />
     <ClInclude Include="kernels.h" />
@@ -178,8 +181,14 @@
     <ClInclude Include="modelShape.h" />
     <ClInclude Include="paramRef.h" />
     <ClInclude Include="qlora_cpu.h">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ExcludedFromBuild>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="download.py" />
+    <None Include="my_raw_data.jsonl" />
+    <None Include="run.py" />
+    <None Include="tokenize_data.py" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

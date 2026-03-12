@@ -1,6 +1,6 @@
 #include "qlora_cpu.h"
-
 #include "loss_ce.h"
+#include "kernels.h" // For scaling function
 
 #include <algorithm>
 #include <chrono>
@@ -9,6 +9,8 @@
 #include <numeric>
 #include <random>
 #include <stdexcept>
+#include <filesystem>
+#include <cmath> // For std::sqrt
 
 void ProgressReporter::onStep(
     int step,
@@ -115,10 +117,12 @@ void CpuQLoRATrainer::trainStep(
         float sampleLossSum = 0.0f;
         std::int64_t sampleTokenCount = 0;
 
-        for (std::size_t t = 0; t < T; ++t) {
+        // THE FIX: Loop goes to T - 1, and target is t + 1
+        for (std::size_t t = 0; t < T - 1; ++t) {
             if (sample->attentionMask[t] == 0) continue;
 
-            const int y = sample->targetIds[t];
+            // Target shift!
+            const int y = sample->targetIds[t + 1];
             if (y == cfg_.ignoreIndex) continue;
             if (y < 0 || static_cast<std::size_t>(y) >= V) continue;
 
@@ -212,6 +216,28 @@ void CpuQLoRATrainer::run() {
 
         if (accumCount < cfg_.gradAccumSteps) continue;
 
+        // --- DEBUG: Check LoRA Gradient Flow ---
+        double loraA_norm = 0.0, loraB_norm = 0.0, loraA_grad_norm = 0.0;
+        for (const auto& p : params) {
+            std::string_view pname(p.name);
+            if (pname == "Aq" || pname == "Av") {
+                for (std::size_t i = 0; i < p.n; ++i) {
+                    loraA_norm += (double)p.w[i] * p.w[i];
+                    if (p.g) loraA_grad_norm += (double)p.g[i] * p.g[i];
+                }
+            }
+            else if (pname == "Bq" || pname == "Bv") {
+                for (std::size_t i = 0; i < p.n; ++i) {
+                    loraB_norm += (double)p.w[i] * p.w[i];
+                }
+            }
+        }
+        if (globalStep % cfg_.logInterval == 0) {
+            printf("[DEBUG] LoRA A norm: %.6f | LoRA B norm: %.6f | dLora A norm: %.6f\n",
+                std::sqrt(loraA_norm), std::sqrt(loraB_norm), std::sqrt(loraA_grad_norm));
+        }
+        // ----------------------------------------
+
         if (cfg_.maxGradNorm > 0.0f) {
             optimizer_.clipGradNorm(params, cfg_.maxGradNorm);
         }
@@ -245,6 +271,19 @@ void CpuQLoRATrainer::run() {
     }
 
     backend_.saveLoRA(cfg_.loraOutputPath);
+
+    if (!std::filesystem::exists(cfg_.loraOutputPath)) {
+        throw std::runtime_error(
+            "saveLoRA returned, but output file was not created: " + cfg_.loraOutputPath
+        );
+    }
+
+    std::cout << "LoRA file exists at: "
+        << std::filesystem::absolute(cfg_.loraOutputPath).string()
+        << "\n";
+    std::cout << "LoRA file size: "
+        << std::filesystem::file_size(cfg_.loraOutputPath)
+        << " bytes\n";
 
     state.step = globalStep;
     state.epoch = epoch_;

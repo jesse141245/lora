@@ -18,25 +18,16 @@
     <ClCompile Include="qlora_cpu.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="cpuKernelBack.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="lion_optimizer.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="kernels.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="attention.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="lora_io.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="bitnet_quant.cpp">
+    <ClCompile Include="loss_ce.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="dataset.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="bitnet_i2_s.cpp">
@@ -45,16 +36,25 @@
     <ClCompile Include="bitnet_i2s_matmul.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="bitnet_quant.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="bitnet_weight.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="dataset.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
-    <ClCompile Include="loss_ce.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="checkpoint.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="cpuKernelBack.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lion_optimizer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lora_io.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="attention.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

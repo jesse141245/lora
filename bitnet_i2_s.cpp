@@ -229,7 +229,7 @@ void dot_i2s_i8_accum_i32_block32_x4(
     int32_t* __restrict accC, int32_t* __restrict accD,
     const uint8_t* __restrict Wq2, std::size_t stride_cols, std::size_t i0, std::size_t hCount,
     const int8_t* __restrict x8A, const int8_t* __restrict x8B,
-    const int8_t* __restrict x8C, const int8_t* __restrict x8D, std::size_t j0) 
+    const int8_t* __restrict x8C, const int8_t* __restrict x8D, std::size_t j0)
 {
 #if defined(__AVX2__)
     const __m256i shift_vec = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);

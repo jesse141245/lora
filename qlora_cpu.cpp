@@ -117,12 +117,14 @@ void CpuQLoRATrainer::trainStep(
         float sampleLossSum = 0.0f;
         std::int64_t sampleTokenCount = 0;
 
-        // THE FIX: Loop goes to T - 1, and target is t + 1
+        // dataset.cpp buildDefaultTargets already sets targetIds[t] = inputIds[t+1].
+        // logitsOut[t*V] is the prediction from token t, so it pairs with targetIds[t].
+        // Using targetIds[t+1] was a double-shift: it compared logits[t] against
+        // inputIds[t+2], which is causally unreachable and keeps loss above ln(vocab).
         for (std::size_t t = 0; t < T - 1; ++t) {
             if (sample->attentionMask[t] == 0) continue;
 
-            // Target shift!
-            const int y = sample->targetIds[t + 1];
+            const int y = sample->targetIds[t];
             if (y == cfg_.ignoreIndex) continue;
             if (y < 0 || static_cast<std::size_t>(y) >= V) continue;
 
@@ -243,6 +245,14 @@ void CpuQLoRATrainer::run() {
         }
 
         optimizer_.step(params, cfg_.zeroGradAfterStep);
+
+        // REQUIRED: zero the backend's LoRA gradient buffers after every step.
+        // optimizer_.step() only zeros the gradient copies inside the optimizer;
+        // the backend's loraGrads_ (gradAq/gradBq/gradAv/gradBv) are separate
+        // memory. Without this call they accumulate across all steps, growing
+        // ~N× too large by step N; clipGradNorm then squashes them to near-zero,
+        // killing all learning signal.
+        backend_.zeroGrad();
 
         ++globalStep;
 

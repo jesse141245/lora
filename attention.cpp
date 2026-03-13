@@ -220,11 +220,19 @@ void attn_causal_backward(
             }
 
             // ── accumulate dV, dQ, dK ────────────────────────────────────────
+            // dS = pj*(dP[j] - sum) is the softmax score gradient.
+            // When late tokens attend many positions, (dP[j] - sum) can be
+            // large while pj≈0, making dS numerically unstable.
+            // Clamp dS to [-10, 10] before multiplying by inv_sqrt_d.
+            // This prevents the attention backward from generating the
+            // gradient spikes (~14x normal) seen in early LoRA training.
+            constexpr float kDSClamp = 10.0f;
             for (std::size_t j = 0; j <= t; ++j) {
                 if (attentionMask && attentionMask[j] == 0) continue;
 
                 const float pj = pr[j];
-                const float dS = pj * (tmp_dP[j] - sum);
+                const float dS_raw = pj * (tmp_dP[j] - sum);
+                const float dS = std::max(-kDSClamp, std::min(kDSClamp, dS_raw));
                 const float aQ = dS * inv_sqrt_d;
                 const float aK = dS * inv_sqrt_d;
 

@@ -147,9 +147,7 @@
     <ClCompile Include="bitnet_quant.cpp" />
     <ClCompile Include="bitnet_weight.cpp" />
     <ClCompile Include="checkpoint.cpp" />
-    <ClCompile Include="cpuKernelBack.cpp">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ExcludedFromBuild>
-    </ClCompile>
+    <ClCompile Include="cpuKernelBack.cpp" />
     <ClCompile Include="dataset.cpp" />
     <ClCompile Include="kernels.cpp" />
     <ClCompile Include="lion_optimizer.cpp" />

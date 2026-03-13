@@ -1,4 +1,4 @@
-﻿#include "bitnet_quant.h"
+#include "bitnet_quant.h"
 
 #include "bitnet_i2_s.h"
 #include "bitnet_weight.h"

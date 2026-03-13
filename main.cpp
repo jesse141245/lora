@@ -24,39 +24,35 @@ int main() {
         cfg.loraOutputPath = std::filesystem::absolute("lora_output.bin").string();
         cfg.checkpointDir = std::filesystem::absolute("checkpoints").string();
 
-        // ── DIMENSIONS & MEMORY ──────────────────────────────────────────
-        // 128 ensures the ENTIRE math question, answer, and EOS token fit.
-        // If the model doesn't see the EOS token, it cannot converge.
-        cfg.maxSeqLen = 128;
+        // maxSeqLen=32: samples are ~25 tokens, 64 was wasting 60% of every
+        // forward/backward pass on masked padding with zero gradient signal.
+        // batchSize=8: feeds the full 8-sample dataset in one accumulation window.
+        // gradAccumSteps=1: step every batch — maximize weight updates per epoch.
+        // maxSteps=500: ~62 passes over 8 samples. Loss should clearly fall
+        // within the first 50 steps and reach near-zero overfit by step 200-300.
+        cfg.maxSeqLen = 32;
+        cfg.batchSize = 8;
+        cfg.gradAccumSteps = 1;
+        cfg.maxSteps = 500;
 
-        // Batch Size 2 keeps the forward/backward intermediate buffers 
-        // extremely small, allowing them to live entirely inside your 
-        // Ryzen 7840U's 16MB L3 Cache. 
-        cfg.batchSize = 2;
+        // Set explicitly — header defaults may be 0 which zeros all LoRA output.
+        cfg.loraRank = 8;
+        cfg.loraAlpha = 8.0f;   // scale = alpha/rank = 1.0
 
-        // We accumulate 4 times to simulate a batch size of 8. 
-        // This gives you the stability of a full-dataset batch, with 
-        // the cache-blistering speed of micro-batches.
-        cfg.gradAccumSteps = 4;
-        cfg.maxSteps = 200;
-
-        // ── OPTIMIZER (LION) ─────────────────────────────────────────────
-        // 1e-6 is slightly too quiet. 5e-6 allows the Lion optimizer 
-        // to actually move the needle out of the 11.9 entropy state.
-        cfg.learningRate = 5e-6f;
+        // lr=1e-6, standard Lion betas, no weight decay, clip=1.0.
+        // The previous instability (step-5 spike, flat loss) was caused by three
+        // bugs now fixed: (1) targetIds double-shift, (2) missing backend_.zeroGrad(),
+        // (3) loraAlpha not set. None of those required a conservative lr.
+        cfg.learningRate = 1e-6f;
         cfg.lionBeta1 = 0.9f;
         cfg.lionBeta2 = 0.99f;
-        cfg.weightDecay = 0.0f; // Perfect. Keep at 0 for LoRA.
+        cfg.weightDecay = 0.0f;
         cfg.maxGradNorm = 1.0f;
 
-        // ── LOGGING ──────────────────────────────────────────────────────
-        // Set to 1. Do not wait 10 steps to find out if the engine works.
-        // You want to see 11.90 drop to 11.85 on step 1!
-        cfg.logInterval = 1;
-        cfg.checkpointInterval = 50;
-        cfg.resumeFromCheckpoint = false; // Start fresh for this test
+        cfg.logInterval = 10;
+        cfg.checkpointInterval = 100;
+        cfg.resumeFromCheckpoint = true;
 
-        // ── QUANTIZATION ─────────────────────────────────────────────────
         cfg.useBitNetQuant = true;
         cfg.bitnetQuantizeQKV = true;
         cfg.bitnetQuantizeWo = true;

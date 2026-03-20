@@ -2,18 +2,85 @@
 #include <iostream>
 #include <string>
 #include <exception>
+#include <algorithm>
+#include <thread>
+#include <cctype>
+#include <cstdlib>
+#include <optional>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 #include "config.h"
 #include "qlora_cpu.h"
 
 namespace fs = std::filesystem;
 
+namespace {
+
+std::size_t normalizeBitNetQk(int value, std::size_t fallback) {
+    if (value <= 0) return fallback;
+    const int clamped = std::max(32, value);
+    return static_cast<std::size_t>((clamped + 31) / 32 * 32);
+}
+
+std::optional<int> getEnvInt(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') return std::nullopt;
+    try {
+        return std::stoi(value);
+    }
+    catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<float> getEnvFloat(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') return std::nullopt;
+    try {
+        return std::stof(value);
+    }
+    catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::optional<bool> getEnvBool(const char* name) {
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') return std::nullopt;
+
+    std::string s(value);
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
+    if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+    return std::nullopt;
+}
+
+} // namespace
+
 int main() {
+    std::cout.setf(std::ios::unitbuf);
+    std::cerr.setf(std::ios::unitbuf);
     std::cerr << "TRAINER MAIN IS RUNNING\n";
     try {
+#if defined(_OPENMP)
+        const int hwThreads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+        const int ompThreads = std::max(1, getEnvInt("QLORA_TEST_OMP_THREADS").value_or(hwThreads));
+        omp_set_dynamic(0);
+        omp_set_num_threads(ompThreads);
+#endif
+
         std::cout << "========================================================\n";
         std::cout << "   BITNET QLORA CPU TRAINING PIPELINE INTEGRATION\n";
         std::cout << "========================================================\n\n";
+#if defined(_OPENMP)
+        std::cout << "OpenMP threads: " << omp_get_max_threads() << "\n";
+#endif
 
         const std::string model_path = "./test_model";
         const std::string dataset_path = "./test_dataset.jsonl";
@@ -24,40 +91,192 @@ int main() {
         cfg.loraOutputPath = std::filesystem::absolute("lora_output.bin").string();
         cfg.checkpointDir = std::filesystem::absolute("checkpoints").string();
 
-        // maxSeqLen=32: samples are ~25 tokens, 64 was wasting 60% of every
-        // forward/backward pass on masked padding with zero gradient signal.
-        // batchSize=8: feeds the full 8-sample dataset in one accumulation window.
-        // gradAccumSteps=1: step every batch — maximize weight updates per epoch.
-        // maxSteps=500: ~62 passes over 8 samples. Loss should clearly fall
-        // within the first 50 steps and reach near-zero overfit by step 200-300.
-        cfg.maxSeqLen = 32;
-        cfg.batchSize = 8;
-        cfg.gradAccumSteps = 1;
-        cfg.maxSteps = 500;
+        cfg.maxSeqLen = 64;      // avoid truncating all current training samples
+        cfg.batchSize = 2;       // increase micro-batch for stabler gradients
+        cfg.gradAccumSteps = 2;  // effective batch = 4
+        cfg.maxSteps = 200;
+        // Full-depth training (0 = all model layers).
+        cfg.forcedLayers = 0;
 
-        // Set explicitly — header defaults may be 0 which zeros all LoRA output.
-        cfg.loraRank = 8;
-        cfg.loraAlpha = 8.0f;   // scale = alpha/rank = 1.0
+        // Higher-capacity adapter for SFT alignment.
+        cfg.loraRank = 32;
+        cfg.loraAlpha = 32.0f; // keep alpha ~= rank
 
-        // lr=1e-6, standard Lion betas, no weight decay, clip=1.0.
-        // The previous instability (step-5 spike, flat loss) was caused by three
-        // bugs now fixed: (1) targetIds double-shift, (2) missing backend_.zeroGrad(),
-        // (3) loraAlpha not set. None of those required a conservative lr.
-        cfg.learningRate = 1e-6f;
+        // Short warmup then constant LR for small-data overfit behavior.
+        cfg.learningRate = 3e-5f;
+        cfg.warmupSteps = -1;
+        cfg.useCosineDecay = false;
+        cfg.useAdamW = true; // set false to use Lion
+        // Reuse beta fields as optimizer betas (AdamW: 0.9 / 0.999).
         cfg.lionBeta1 = 0.9f;
-        cfg.lionBeta2 = 0.99f;
+        cfg.lionBeta2 = 0.999f;
         cfg.weightDecay = 0.0f;
-        cfg.maxGradNorm = 1.0f;
+        cfg.maxGradNorm = 1.0f;  // kept but note: has no effect on Lion step size
 
-        cfg.logInterval = 10;
+        cfg.logInterval = 1;     // show progress every step
         cfg.checkpointInterval = 100;
-        cfg.resumeFromCheckpoint = true;
+        // Start fresh after fixing label alignment; avoids loading stale optimizer state.
+        cfg.resumeFromCheckpoint = false;
+
+        // Explicitly zero gradients after each optimizer step.
+        // If left at the TrainerConfig default (which may be false), gradients
+        // from step N accumulate into step N+1, corrupting every subsequent update.
+        cfg.zeroGradAfterStep = true;
+
+        // Non-zero seed enables epoch shuffling so the small dataset cycles in a
+        // different order each epoch rather than always repeating the same sequence.
+        cfg.seed = 42;
+        // Overfit debug mode toggle:
+        // set to 0..N-1 to repeatedly train on one sample, -1 for normal sampling.
+        cfg.overfitSampleIndex = -1;
 
         cfg.useBitNetQuant = true;
         cfg.bitnetQuantizeQKV = true;
+        cfg.bitnetFuseQKV = true;
         cfg.bitnetQuantizeWo = true;
+        cfg.bitnetQuantizeLmHead = false;
+        cfg.tTile = 2;
         cfg.bitnetQK = 128;
+        cfg.bitnetFfnQK = 0;
         cfg.bitnetJQ = 32;
+
+        if (const auto v = getEnvInt("QLORA_TEST_MAX_STEPS")) {
+            cfg.maxSteps = std::max(1, *v);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_BATCH_SIZE")) {
+            cfg.batchSize = std::max(1, *v);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_T_TILE")) {
+            cfg.tTile = static_cast<std::size_t>(std::max(1, *v));
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_LORA_RANK")) {
+            cfg.loraRank = static_cast<std::size_t>(std::max(1, *v));
+        }
+        if (const auto v = getEnvFloat("QLORA_TEST_LORA_ALPHA")) {
+            cfg.loraAlpha = std::max(0.0f, *v);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_BITNET_QK")) {
+            cfg.bitnetQK = normalizeBitNetQk(*v, cfg.bitnetQK);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_BITNET_FFN_QK")) {
+            cfg.bitnetFfnQK = (*v <= 0) ? 0u : normalizeBitNetQk(*v, cfg.bitnetQK);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_GRAD_ACCUM")) {
+            cfg.gradAccumSteps = std::max(1, *v);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_LOG_INTERVAL")) {
+            cfg.logInterval = std::max(0, *v);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_CHECKPOINT_INTERVAL")) {
+            cfg.checkpointInterval = std::max(0, *v);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_FORCED_LAYERS")) {
+            cfg.forcedLayers = (*v <= 0) ? 0u : static_cast<std::size_t>(*v);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_OVERFIT_SAMPLE")) {
+            cfg.overfitSampleIndex = *v;
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_WARMUP_STEPS")) {
+            cfg.warmupSteps = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_USE_COSINE_DECAY")) {
+            cfg.useCosineDecay = *v;
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_DECAY_START_STEP")) {
+            cfg.decayStartStep = *v;
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_DECAY_STEPS")) {
+            cfg.decaySteps = *v;
+        }
+        if (const auto v = getEnvFloat("QLORA_TEST_MIN_LR_FACTOR")) {
+            cfg.minLrFactor = std::max(0.0f, *v);
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_USE_ADAMW")) {
+            cfg.useAdamW = *v;
+        }
+        if (const auto v = getEnvFloat("QLORA_TEST_LR")) {
+            cfg.learningRate = *v;
+        }
+        if (const auto v = getEnvFloat("QLORA_TEST_MIN_STEPS_S")) {
+            cfg.minStepsPerSec = std::max(0.0f, *v);
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_MIN_STEPS_S_GRACE")) {
+            cfg.minStepsPerSecGrace = std::max(0, *v);
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_LM_HEAD_QUANT")) {
+            cfg.bitnetQuantizeLmHead = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_LM_HEAD_FLOAT_BWD")) {
+            cfg.bitnetLmHeadFloatBackward = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_LM_HEAD_BWD_QUANT")) {
+            cfg.bitnetLmHeadQuantBackwardOnly = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_BITNET_QKV")) {
+            cfg.bitnetQuantizeQKV = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_BITNET_WO")) {
+            cfg.bitnetQuantizeWo = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_BITNET_H32")) {
+            cfg.bitnetHadamard32 = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_BITNET_TL2_QKV")) {
+            cfg.bitnetTl2Qkv = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_BITNET_TL2_WO")) {
+            cfg.bitnetTl2Wo = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_BITNET_TL2_FFN")) {
+            cfg.bitnetTl2Ffn = *v;
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_BITNET_TL2_BK")) {
+            cfg.bitnetTl2Bk = static_cast<std::size_t>(std::max(1, *v));
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_BITNET_FUSE_QKV")) {
+            cfg.bitnetFuseQKV = *v;
+        }
+        if (const auto v = getEnvBool("QLORA_TEST_USE_BITNET_QUANT")) {
+            cfg.useBitNetQuant = *v;
+        }
+        const bool bitnetFfnEnabled = getEnvBool("QLORA_TEST_BITNET_FFN").value_or(true);
+        const float bitnetActClipRms = getEnvFloat("QLORA_TEST_BITNET_ACT_CLIP_RMS").value_or(0.0f);
+
+        std::cout << "Test overrides:"
+            << " forcedLayers=" << cfg.forcedLayers
+            << " lmHeadQuant=" << (cfg.bitnetQuantizeLmHead ? "on" : "off")
+            << " lmHeadFloatBwd=" << (cfg.bitnetLmHeadFloatBackward ? "on" : "off")
+            << " lmHeadBwdQuant=" << (cfg.bitnetLmHeadQuantBackwardOnly ? "on" : "off")
+            << " qkvQuant=" << (cfg.bitnetQuantizeQKV ? "on" : "off")
+            << " woQuant=" << (cfg.bitnetQuantizeWo ? "on" : "off")
+            << " bitnetFfn=" << (bitnetFfnEnabled ? "on" : "off")
+            << " h32=" << (cfg.bitnetHadamard32 ? "on" : "off")
+            << " tl2Qkv=" << (cfg.bitnetTl2Qkv ? "on" : "off")
+            << " tl2Wo=" << (cfg.bitnetTl2Wo ? "on" : "off")
+            << " tl2Ffn=" << (cfg.bitnetTl2Ffn ? "on" : "off")
+            << " fuseQKV=" << (cfg.bitnetFuseQKV ? "on" : "off")
+            << " maxSteps=" << cfg.maxSteps
+            << " batchSize=" << cfg.batchSize
+            << " gradAccum=" << cfg.gradAccumSteps
+            << " logInterval=" << cfg.logInterval
+            << " checkpointInterval=" << cfg.checkpointInterval
+            << " loraRank=" << cfg.loraRank
+            << " loraAlpha=" << cfg.loraAlpha
+            << " tTile=" << cfg.tTile
+            << " actClipRms=" << bitnetActClipRms
+            << " bitnetQK=" << cfg.bitnetQK
+            << " bitnetFfnQK=" << (cfg.bitnetFfnQK == 0 ? cfg.bitnetQK : cfg.bitnetFfnQK)
+            << " bitnetTl2Bk=" << cfg.bitnetTl2Bk
+            << " overfitSampleIndex=" << cfg.overfitSampleIndex
+            << " lr=" << cfg.learningRate
+            << " optimizer=" << (cfg.useAdamW ? "adamw" : "lion")
+            << " warmup=" << cfg.warmupSteps
+            << " decayStart=" << cfg.decayStartStep
+            << " minLrFactor=" << cfg.minLrFactor
+            << " cosine=" << (cfg.useCosineDecay ? "on" : "off")
+            << " minStepsS=" << cfg.minStepsPerSec
+            << " minStepsGrace=" << cfg.minStepsPerSecGrace
+            << "\n";
 
         std::cout << "[2/2] Starting Training Loop...\n";
         int result = runCpuQLoRATrainer(cfg, dataset_path);

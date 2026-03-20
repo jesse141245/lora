@@ -69,7 +69,8 @@ void quantize_ternary_i2s_blockwise(
     std::size_t rows,
     std::size_t cols,
     std::size_t qk,
-    std::size_t jq
+    std::size_t jq,
+    bool hadamard32 = false
 );
 
 

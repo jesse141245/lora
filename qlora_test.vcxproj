@@ -108,7 +108,7 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <AdditionalIncludeDirectories>$(ProjectDir)external\json\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)external\json\include;$(ProjectDir)BitNet\include;$(ProjectDir)BitNet\3rdparty\llama.cpp\ggml\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <Optimization>MaxSpeed</Optimization>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
@@ -131,18 +131,25 @@
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <OpenMPSupport>true</OpenMPSupport>
+      <AdditionalIncludeDirectories>$(ProjectDir)external\json\include;$(ProjectDir)BitNet\include;$(ProjectDir)BitNet\3rdparty\llama.cpp\ggml\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions> /openmp /fp:fast /clang:-O3 /clang:-ffast-math /clang:-march=znver4</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <LinkTimeCodeGeneration>UseLinkTimeCodeGeneration</LinkTimeCodeGeneration>
+      <AdditionalLibraryDirectories>$(VCInstallDir)Tools\Llvm\x64\lib;$(VCInstallDir)Tools\Llvm\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>libomp.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="adamw_optimizer.cpp">
+      <ObjectFileName>$(IntDir)adamw_optimizer_adamw.obj</ObjectFileName>
+    </ClCompile>
     <ClCompile Include="attention.cpp" />
     <ClCompile Include="bitnet_i2s_matmul.cpp" />
+    <ClCompile Include="bitnet_tl2_generated.cpp" />
+    <ClCompile Include="bitnet_tl2_matmul.cpp" />
     <ClCompile Include="bitnet_i2_s.cpp" />
     <ClCompile Include="bitnet_quant.cpp" />
     <ClCompile Include="bitnet_weight.cpp" />
@@ -159,8 +166,11 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="adamw_optimizer.h" />
     <ClInclude Include="attention.h" />
     <ClInclude Include="bitnet_i2s_matmul.h" />
+    <ClInclude Include="bitnet_tl2_generated.h" />
+    <ClInclude Include="bitnet_tl2_matmul.h" />
     <ClInclude Include="bitnet_i2_s.h" />
     <ClInclude Include="bitnet_quant.h" />
     <ClInclude Include="bitnet_weight.h" />
@@ -175,6 +185,7 @@
     <ClInclude Include="lora_io.h" />
     <ClInclude Include="lora_type.h" />
     <ClInclude Include="loss_ce.h" />
+    <ClInclude Include="lr_scheduler.h" />
     <ClInclude Include="optimizer.h" />
     <ClInclude Include="modelShape.h" />
     <ClInclude Include="paramRef.h" />

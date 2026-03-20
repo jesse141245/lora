@@ -22,16 +22,6 @@ namespace {
         return _mm_cvtss_f32(m);
     }
 
-    inline float hsum256_ps(__m256 v) {
-        __m128 lo = _mm256_castps256_ps128(v);
-        __m128 hi = _mm256_extractf128_ps(v, 1);
-        lo = _mm_add_ps(lo, hi);
-        __m128 shuf = _mm_movehdup_ps(lo);
-        __m128 sums = _mm_add_ps(lo, shuf);
-        shuf = _mm_movehl_ps(shuf, sums);
-        sums = _mm_add_ss(sums, shuf);
-        return _mm_cvtss_f32(sums);
-    }
 #endif
 
     inline float max_avx2_or_scalar(const float* x, std::size_t n) {
@@ -59,32 +49,6 @@ namespace {
             m = std::max(m, x[i]);
         }
         return m;
-#endif
-    }
-
-    inline float sum_avx2_or_scalar(const float* x, std::size_t n) {
-        if (!x) throw std::runtime_error("sum_avx2_or_scalar: x is null");
-
-#if defined(__AVX2__)
-        std::size_t i = 0;
-        __m256 acc = _mm256_setzero_ps();
-
-        for (; i + 8 <= n; i += 8) {
-            const __m256 xv = _mm256_loadu_ps(x + i);
-            acc = _mm256_add_ps(acc, xv);
-        }
-
-        float s = hsum256_ps(acc);
-        for (; i < n; ++i) {
-            s += x[i];
-        }
-        return s;
-#else
-        float s = 0.0f;
-        for (std::size_t i = 0; i < n; ++i) {
-            s += x[i];
-        }
-        return s;
 #endif
     }
 
@@ -135,11 +99,13 @@ float cross_entropy_dlogits_row(
     // Numerical stability
     const float m = max_avx2_or_scalar(logits, V);
 
+    float sumExp = 1e-9f;
     for (std::size_t v = 0; v < V; ++v) {
-        dlog[v] = std::exp(logits[v] - m);
+        const float ev = std::exp(logits[v] - m);
+        dlog[v] = ev;
+        sumExp += ev;
     }
 
-    const float sumExp = sum_avx2_or_scalar(dlog, V) + 1e-9f;
     const float invSum = 1.0f / sumExp;
     scale_inplace_avx2_or_scalar(dlog, V, invSum);
 

@@ -5,6 +5,7 @@
 #include <string>
 
 class CpuKernelBackend;
+class AdamWOptimizer;
 class LionOptimizer;
 
 struct CheckpointState {
@@ -19,9 +20,18 @@ public:
 
     std::optional<CheckpointState> loadLatest(
         CpuKernelBackend& backend,
+        AdamWOptimizer& opt
+    );
+    std::optional<CheckpointState> loadLatest(
+        CpuKernelBackend& backend,
         LionOptimizer& opt
     );
 
+    void save(
+        const CpuKernelBackend& backend,
+        const AdamWOptimizer& opt,
+        const CheckpointState& state
+    );
     void save(
         const CpuKernelBackend& backend,
         const LionOptimizer& opt,

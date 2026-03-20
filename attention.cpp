@@ -3,6 +3,13 @@
 #include <cmath>
 #include <cstring>
 #include <immintrin.h>
+#include <stdexcept>
+#include <vector>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #include "attention.h"
 
 // ===========================================================================
@@ -34,7 +41,7 @@ static void softmax_inplace(float* __restrict p, std::size_t n)
     std::size_t i = 0;
     for (; i + 8 <= n; i += 8)
         vmx = _mm256_max_ps(vmx, _mm256_loadu_ps(p + i));
-    float mx = hsum256(_mm256_max_ps(vmx, _mm256_permute2f128_ps(vmx, vmx, 1)));
+    float mx = -1e38f;
     // horizontal max from the 8 lanes
     __m128 lo = _mm256_castps256_ps128(vmx);
     __m128 hi = _mm256_extractf128_ps(vmx, 1);
@@ -122,6 +129,16 @@ void attn_causal(
     float* __restrict probs,
     const int* attentionMask)
 {
+    if (nHeads == 0 || nKvHeads == 0) {
+        throw std::runtime_error("attn_causal: nHeads and nKvHeads must be > 0");
+    }
+    if (H % nHeads != 0) {
+        throw std::runtime_error("attn_causal: H must be divisible by nHeads");
+    }
+    if (nHeads % nKvHeads != 0) {
+        throw std::runtime_error("attn_causal: nHeads must be divisible by nKvHeads (GQA)");
+    }
+
     const std::size_t D = H / nHeads;
     const std::size_t kvDim = nKvHeads * D;
     const float       inv_sqrt_d = 1.0f / std::sqrt(float(D));
@@ -129,14 +146,18 @@ void attn_causal(
 
     std::fill(ctx, ctx + T * H, 0.0f);
 
-    for (std::size_t h = 0; h < nHeads; ++h) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int h_i = 0; h_i < static_cast<int>(nHeads); ++h_i) {
+        const std::size_t h = static_cast<std::size_t>(h_i);
         const std::size_t kv_h = h / heads_per_group;
 
         for (std::size_t t = 0; t < T; ++t) {
             if (attentionMask && attentionMask[t] == 0) continue;
 
             const float* qt = q + t * H + h * D;
-            float* sc = scores + t * T;
+            float* sc = scores + (h * T * T) + (t * T);
 
             // ── Q·K scores ───────────────────────────────────────────────────
             for (std::size_t j = 0; j <= t; ++j) {
@@ -149,7 +170,7 @@ void attn_causal(
             for (std::size_t j = t + 1; j < T; ++j) sc[j] = -1e9f;
 
             // ── softmax ───────────────────────────────────────────────────────
-            float* pr = probs + t * T;
+            float* pr = probs + (h * T * T) + (t * T);
             std::memcpy(pr, sc, T * sizeof(float));
             softmax_inplace(pr, T);
 
@@ -189,61 +210,73 @@ void attn_causal_backward(
     const int* attentionMask,
     float* __restrict tmp_dP)
 {
+    if (nHeads == 0 || nKvHeads == 0) {
+        throw std::runtime_error("attn_causal_backward: nHeads and nKvHeads must be > 0");
+    }
+    if (H % nHeads != 0) {
+        throw std::runtime_error("attn_causal_backward: H must be divisible by nHeads");
+    }
+    if (nHeads % nKvHeads != 0) {
+        throw std::runtime_error("attn_causal_backward: nHeads must be divisible by nKvHeads (GQA)");
+    }
+
     const std::size_t D = H / nHeads;
     const std::size_t kvDim = nKvHeads * D;
     const float       inv_sqrt_d = 1.0f / std::sqrt(float(D));
     const std::size_t heads_per_group = nHeads / nKvHeads;
 
-    for (std::size_t head = 0; head < nHeads; ++head) {
-        const std::size_t kv_h = head / heads_per_group;
+    (void)tmp_dP;
 
-        for (std::size_t t = 0; t < T; ++t) {
-            if (attentionMask && attentionMask[t] == 0) continue;
+#if defined(_OPENMP)
+#pragma omp parallel
+#endif
+    {
+        std::vector<float> tmpLocal(T, 0.0f);
 
-            const float* pr = probs + t * T;
-            const float* dCt = dCtx + t * H + head * D;
-            const float* Qt = q + t * H + head * D;
-            float* dQt = dQ + t * H + head * D;
+#if defined(_OPENMP)
+#pragma omp for schedule(static)
+#endif
+        for (int kv_i = 0; kv_i < static_cast<int>(nKvHeads); ++kv_i) {
+            const std::size_t kv_h = static_cast<std::size_t>(kv_i);
+            const std::size_t headBegin = kv_h * heads_per_group;
+            const std::size_t headEnd = headBegin + heads_per_group;
 
-            // FIX: zero the full T-length scratch buffer before use.
-            // Previously masked positions carried stale values from the
-            // previous head, corrupting the softmax backward sum.
-            std::memset(tmp_dP, 0, T * sizeof(float));
+            for (std::size_t head = headBegin; head < headEnd; ++head) {
+                for (std::size_t t = 0; t < T; ++t) {
+                    if (attentionMask && attentionMask[t] == 0) continue;
 
-            // ── dP[j] = dot(dCtx[t,head], V[j,kv_h])  ───────────────────────
-            float sum = 0.0f;
-            for (std::size_t j = 0; j <= t; ++j) {
-                if (attentionMask && attentionMask[j] == 0) continue;
-                const float dp = dot_D(dCt, v + j * kvDim + kv_h * D, D);
-                tmp_dP[j] = dp;
-                sum += pr[j] * dp;
-            }
+                    const float* pr = probs + (head * T * T) + (t * T);
+                    const float* dCt = dCtx + t * H + head * D;
+                    const float* Qt = q + t * H + head * D;
+                    float* dQt = dQ + t * H + head * D;
 
-            // ── accumulate dV, dQ, dK ────────────────────────────────────────
-            // dS = pj*(dP[j] - sum) is the softmax score gradient.
-            // When late tokens attend many positions, (dP[j] - sum) can be
-            // large while pj≈0, making dS numerically unstable.
-            // Clamp dS to [-10, 10] before multiplying by inv_sqrt_d.
-            // This prevents the attention backward from generating the
-            // gradient spikes (~14x normal) seen in early LoRA training.
-            constexpr float kDSClamp = 10.0f;
-            for (std::size_t j = 0; j <= t; ++j) {
-                if (attentionMask && attentionMask[j] == 0) continue;
+                    std::fill(tmpLocal.begin(), tmpLocal.begin() + static_cast<std::ptrdiff_t>(t + 1), 0.0f);
 
-                const float pj = pr[j];
-                const float dS_raw = pj * (tmp_dP[j] - sum);
-                const float dS = std::max(-kDSClamp, std::min(kDSClamp, dS_raw));
-                const float aQ = dS * inv_sqrt_d;
-                const float aK = dS * inv_sqrt_d;
+                    // ── dP[j] = dot(dCtx[t,head], V[j,kv_h])  ─────────────────────
+                    float sum = 0.0f;
+                    for (std::size_t j = 0; j <= t; ++j) {
+                        if (attentionMask && attentionMask[j] == 0) continue;
+                        const float dp = dot_D(dCt, v + j * kvDim + kv_h * D, D);
+                        tmpLocal[j] = dp;
+                        sum += pr[j] * dp;
+                    }
 
-                // dV[j,kv_h] += pr[j] * dCtx[t,head]
-                axpy_D(dV + j * kvDim + kv_h * D, dCt, pj, D);
+                    // ── accumulate dV, dQ, dK ─────────────────────────────────────
+                    constexpr float kDSClamp = 10.0f;
+                    for (std::size_t j = 0; j <= t; ++j) {
+                        if (attentionMask && attentionMask[j] == 0) continue;
 
-                // dQ[t,head] += dS/sqrt(D) * K[j,kv_h]
-                axpy_D(dQt, k + j * kvDim + kv_h * D, aQ, D);
+                        const float pj = pr[j];
+                        const float dS_raw = pj * (tmpLocal[j] - sum);
+                        const float dS = std::max(-kDSClamp, std::min(kDSClamp, dS_raw));
+                        const float aQ = dS * inv_sqrt_d;
+                        const float aK = dS * inv_sqrt_d;
 
-                // dK[j,kv_h] += dS/sqrt(D) * Q[t,head]
-                axpy_D(dK + j * kvDim + kv_h * D, Qt, aK, D);
+                        axpy_D(dV + j * kvDim + kv_h * D, dCt, pj, D);
+                        axpy_D(dQt, k + j * kvDim + kv_h * D, aQ, D);
+                        axpy_D(dK + j * kvDim + kv_h * D, Qt, aK, D);
+                    }
+                }
             }
         }
     }

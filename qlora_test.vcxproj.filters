@@ -15,6 +15,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="adamw_optimizer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="qlora_cpu.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -34,6 +37,12 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="bitnet_i2s_matmul.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="bitnet_tl2_generated.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="bitnet_tl2_matmul.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="bitnet_quant.cpp">
@@ -59,6 +68,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="adamw_optimizer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="qlora_cpu.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -104,6 +116,12 @@
     <ClInclude Include="bitnet_i2s_matmul.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="bitnet_tl2_generated.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bitnet_tl2_matmul.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="dataset.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -111,6 +129,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="checkpoint.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lr_scheduler.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

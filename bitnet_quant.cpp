@@ -1,6 +1,7 @@
 #include "bitnet_quant.h"
 
 #include "bitnet_i2_s.h"
+#include "bitnet_transform.h"
 #include "bitnet_weight.h"
 
 #include <algorithm>
@@ -8,6 +9,10 @@
 #include <immintrin.h>
 #include <stdexcept>
 #include <vector>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 // ============================================================
 // Legacy ternary blockwise quantization
@@ -99,11 +104,15 @@ void quantize_ternary_i2s_blockwise(
     std::size_t rows,
     std::size_t cols,
     std::size_t qk,
-    std::size_t jq)
+    std::size_t jq,
+    bool hadamard32)
 {
     if (!W) throw std::runtime_error("quantize_ternary_i2s_blockwise: W null");
     if (rows == 0 || cols == 0) throw std::runtime_error("quantize_ternary_i2s_blockwise: Zero dim");
     if ((cols % 32) != 0) throw std::runtime_error("quantize_ternary_i2s_blockwise: cols must be multiple of 32");
+    if (hadamard32 && ((rows % 32) != 0 || (qk % 32) != 0)) {
+        throw std::runtime_error("quantize_ternary_i2s_blockwise: hadamard32 requires rows and qk to be multiples of 32");
+    }
 
     const std::size_t N = rows * cols;
     const std::size_t nKBlocks = (rows + qk - 1) / qk;
@@ -111,6 +120,7 @@ void quantize_ternary_i2s_blockwise(
 
     out.rows = rows;
     out.cols = cols;
+    out.hadamard32 = hadamard32;
     out.qk = qk;
     out.jq = jq;
     out.q2.clear();
@@ -118,30 +128,70 @@ void quantize_ternary_i2s_blockwise(
 
     std::vector<int8_t> q(N, 0);
 
-    for (std::size_t jb = 0; jb < nJBlocks; ++jb) {
-        const std::size_t j0 = jb * jq;
-        const std::size_t j1 = std::min(cols, j0 + jq);
-
-        for (std::size_t kb = 0; kb < nKBlocks; ++kb) {
+    const int nJBlocksI = static_cast<int>(nJBlocks);
+    const int nKBlocksI = static_cast<int>(nKBlocks);
+#if defined(_OPENMP)
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int jbI = 0; jbI < nJBlocksI; ++jbI) {
+        for (int kbI = 0; kbI < nKBlocksI; ++kbI) {
+            const std::size_t jb = static_cast<std::size_t>(jbI);
+            const std::size_t kb = static_cast<std::size_t>(kbI);
+            const std::size_t j0 = jb * jq;
+            const std::size_t j1 = std::min(cols, j0 + jq);
             const std::size_t i0 = kb * qk;
             const std::size_t i1 = std::min(rows, i0 + qk);
+            const std::size_t tileRows = i1 - i0;
+            const std::size_t tileCols = j1 - j0;
 
             float amax = 0.0f;
-            for (std::size_t i = i0; i < i1; ++i) {
+            if (hadamard32) {
+                std::vector<float> tile(tileRows * tileCols, 0.0f);
                 for (std::size_t j = j0; j < j1; ++j) {
-                    amax = std::max(amax, std::abs(W[i * cols + j]));
+                    const std::size_t jLocal = j - j0;
+                    for (std::size_t rowBase = 0; rowBase < tileRows; rowBase += 32) {
+                        float tmp[32];
+                        for (std::size_t u = 0; u < 32; ++u) {
+                            tmp[u] = W[(i0 + rowBase + u) * cols + j];
+                        }
+                        hadamard32_inplace(tmp);
+                        for (std::size_t u = 0; u < 32; ++u) {
+                            const float v = tmp[u];
+                            tile[(rowBase + u) * tileCols + jLocal] = v;
+                            amax = std::max(amax, std::abs(v));
+                        }
+                    }
+                }
+
+                const float s = (amax > 0.0f) ? amax : 1.0f;
+                out.w_scale_tile[jb * nKBlocks + kb] = s;
+                const float inv_s = 1.0f / s;
+
+                for (std::size_t rowLocal = 0; rowLocal < tileRows; ++rowLocal) {
+                    for (std::size_t colLocal = 0; colLocal < tileCols; ++colLocal) {
+                        const float v = tile[rowLocal * tileCols + colLocal] * inv_s;
+                        const int qi = (v > 0.5f) ? 1 : (v < -0.5f) ? -1 : 0;
+                        q[(i0 + rowLocal) * cols + (j0 + colLocal)] = static_cast<int8_t>(qi);
+                    }
                 }
             }
+            else {
+                for (std::size_t i = i0; i < i1; ++i) {
+                    for (std::size_t j = j0; j < j1; ++j) {
+                        amax = std::max(amax, std::abs(W[i * cols + j]));
+                    }
+                }
 
-            const float s = (amax > 0.0f) ? amax : 1.0f;
-            out.w_scale_tile[jb * nKBlocks + kb] = s;
-            const float inv_s = 1.0f / s;
+                const float s = (amax > 0.0f) ? amax : 1.0f;
+                out.w_scale_tile[jb * nKBlocks + kb] = s;
+                const float inv_s = 1.0f / s;
 
-            for (std::size_t i = i0; i < i1; ++i) {
-                for (std::size_t j = j0; j < j1; ++j) {
-                    const float v = W[i * cols + j] * inv_s;
-                    int qi = (v > 0.5f) ? 1 : (v < -0.5f) ? -1 : 0;
-                    q[i * cols + j] = static_cast<int8_t>(qi);
+                for (std::size_t i = i0; i < i1; ++i) {
+                    for (std::size_t j = j0; j < j1; ++j) {
+                        const float v = W[i * cols + j] * inv_s;
+                        const int qi = (v > 0.5f) ? 1 : (v < -0.5f) ? -1 : 0;
+                        q[i * cols + j] = static_cast<int8_t>(qi);
+                    }
                 }
             }
         }

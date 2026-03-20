@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cstddef>
 #include <vector>
@@ -15,6 +15,16 @@ struct ModelShape {
     std::size_t nLayers;
     std::size_t nHeads;
     std::size_t nKvHeads;
+    std::size_t ffnSize;
+    std::size_t ropeDim;
+    float ropeTheta;
+
+    std::size_t headDim() const { return hiddenSize / nHeads; }
+    // kvDim is the authoritative source for key/value projection width.
+    // Deriving it from a live weight tensor (Wk.size()/H) couples
+    // correctness to keeping FP32 weights resident and breaks if they
+    // are freed after quantization. Use this method everywhere instead.
+    std::size_t kvDim()   const { return nKvHeads * headDim(); }
 };
 
 struct LayerWeights {
@@ -23,11 +33,33 @@ struct LayerWeights {
     std::vector<float> Wv;
     std::vector<float> Wo;
     std::vector<float> rms_attn;
+    std::vector<float> rms_ffn;
+    std::vector<float> Wgate;
+    std::vector<float> Wup;
+    std::vector<float> Wdown;
 
     BitNetMatI2S Wq_q;
     BitNetMatI2S Wk_q;
     BitNetMatI2S Wv_q;
     BitNetMatI2S Wo_q;
+    BitNetMatI2S Wgate_q;
+    BitNetMatI2S Wup_q;
+    BitNetMatI2S Wdown_q;
+
+    BitNetMatTL2 Wq_tl2;
+    BitNetMatTL2 Wk_tl2;
+    BitNetMatTL2 Wv_tl2;
+    BitNetMatTL2 Wo_tl2;
+    BitNetMatTL2 Wgate_tl2;
+    BitNetMatTL2 Wup_tl2;
+    BitNetMatTL2 Wdown_tl2;
+    BitNetMatTL2Gen Wq_tl2g;
+    BitNetMatTL2Gen Wk_tl2g;
+    BitNetMatTL2Gen Wv_tl2g;
+    BitNetMatTL2Gen Wo_tl2g;
+    BitNetMatTL2Gen Wgate_tl2g;
+    BitNetMatTL2Gen Wup_tl2g;
+    BitNetMatTL2Gen Wdown_tl2g;
 };
 
 struct LayerLoRA {
@@ -54,13 +86,15 @@ public:
     void forward(
         std::span<const int> inputIds,
         std::span<const int> attentionMask,
-        std::span<float> logitsOut
+        std::span<float> logitsOut,
+        std::span<const int> lossMask = {}
     );
 
     void backward(
         std::span<const int> inputIds,
         std::span<const int> attentionMask,
-        std::span<const float> dLogits
+        std::span<const float> dLogits,
+        std::span<const int> lossMask = {}
     );
 
     void zeroGrad();
@@ -85,6 +119,14 @@ private:
 
     std::vector<float> tmpQ_cache_;
     std::vector<float> tmpV_cache_;
+    std::vector<float> xnorm_cache_;
+    std::vector<float> q_cache_;
+    std::vector<float> k_cache_;
+    std::vector<float> v_cache_;
+    std::vector<float> probs_cache_;
+    std::vector<float> x_mid_cache_;
+    std::vector<float> gate_cache_;
+    std::vector<float> up_cache_;
 
     std::vector<float> x_;
     std::vector<float> xnorm_;
@@ -106,6 +148,20 @@ private:
     std::vector<float> dV_;
     std::vector<float> dXnorm_;
     std::vector<float> dXin_;
+    std::vector<float> dXmid_;
+
+    std::vector<float> x_mid_;
+    std::vector<float> xnorm_ffn_;
+    std::vector<float> gate_;
+    std::vector<float> up_;
+    std::vector<float> ffn_act_;
+    std::vector<float> ffn_out_;
+
+    std::vector<float> dFfnOut_;
+    std::vector<float> dAct_;
+    std::vector<float> dGate_;
+    std::vector<float> dUp_;
+    std::vector<float> dXnormFfn_;
 
     std::vector<float> rms_final_;
     std::vector<float> xnorm_final_;
@@ -113,4 +169,16 @@ private:
 
     std::vector<float> x_ckpt_;
     std::vector<float> tmpdP_;
+    std::vector<std::size_t> lmHeadRowsScratch_;
+
+    // ── Persistent scratch buffers (avoids per-step heap churn) ──────────────
+    // Sized once in the constructor; reused every forward/backward call.
+    std::vector<int8_t> fwdX8Scratch_;      // tTile * H
+    std::vector<float>  fwdXScaleScratch_;  // tTile * max(nKBlocks across all mats)
+    std::vector<int8_t> bwdDY8Scratch_;     // tTile * max(out-dim) for LM-head bwd
+    std::vector<float>  bwdDYScaleScratch_; // tTile * max(nJBlocks across all mats)
+    std::vector<int8_t> bwdDK8Scratch_;     // tTile * max(kvDim, ffnDim) for fused bwd paths
+    std::vector<float>  bwdDKScaleScratch_; // tTile * ceil(max(kvDim, ffnDim)/jq)
+    std::vector<int8_t> bwdDV8Scratch_;     // tTile * max(kvDim, ffnDim) for fused bwd paths
+    std::vector<float>  bwdDVScaleScratch_; // tTile * ceil(max(kvDim, ffnDim)/jq)
 };

@@ -53,6 +53,23 @@ void linear_fused_qkv_forward_bitnet_i2s_accum(
 );
 
 // ------------------------------------------------------------
+// linear_fused_dual_forward_bitnet_i2s_accum
+// ------------------------------------------------------------
+// Fused forward computation for two same-shape projections.
+// Reuses the quantized X tile and walks both weight matrices together.
+void linear_fused_dual_forward_bitnet_i2s_accum(
+    float* __restrict Ya,
+    float* __restrict Yb,
+    const float* __restrict X,
+    const BitNetMatI2S& Wa,
+    const BitNetMatI2S& Wb,
+    std::size_t T,
+    std::size_t tTile,
+    int8_t* __restrict x8Scratch,
+    float* __restrict xScaleScratch
+);
+
+// ------------------------------------------------------------
 // linear_backward_bitnet_i2s_packed
 // ------------------------------------------------------------
 // Computes the backward pass input gradient: dX += dY * W^T
@@ -92,4 +109,23 @@ void linear_fused_qkv_backward_bitnet_i2s_packed(
     float* __restrict dkScaleScratch,
     int8_t* __restrict dv8Scratch,
     float* __restrict dvScaleScratch
+);
+
+// ------------------------------------------------------------
+// linear_fused_dual_backward_bitnet_i2s_packed
+// ------------------------------------------------------------
+// Computes a fused backward pass for two same-shape projections:
+// dX += dYa * Wa^T + dYb * Wb^T
+void linear_fused_dual_backward_bitnet_i2s_packed(
+    float* __restrict dX,
+    const float* __restrict dYa,
+    const float* __restrict dYb,
+    const BitNetMatI2S& Wa,
+    const BitNetMatI2S& Wb,
+    std::size_t T,
+    std::size_t tTile,
+    int8_t* __restrict dyA8Scratch,
+    float* __restrict dyAScaleScratch,
+    int8_t* __restrict dyB8Scratch,
+    float* __restrict dyBScaleScratch
 );

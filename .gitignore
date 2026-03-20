@@ -55,7 +55,8 @@ bitnet_env/
 test_model/
 checkpoints/
 lora_output.bin
-
+tests/
+tests/constrained_runs/
 # ======================================================
 # Datasets
 # ======================================================

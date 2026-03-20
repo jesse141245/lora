@@ -4,26 +4,307 @@
 #include <cstddef>
 #include <cmath>
 #include <algorithm>
+#include <array>
 #include <immintrin.h>
 #include <cstdint>
 #include <stdexcept>
+#include <vector>
 #include "kernels.h"
 #include "bitnet_weight.h"
 #include "bitnet_quant.h"
 
-// ===========================================================================
-// Internal AVX2 helpers
-// ===========================================================================
+namespace {
 
-// Horizontal sum of 8 floats in a __m256 register.
-static inline float hsum256(__m256 v) {
-    __m128 lo = _mm256_castps256_ps128(v);
-    __m128 hi = _mm256_extractf128_ps(v, 1);
-    __m128 sum = _mm_add_ps(lo, hi);
-    sum = _mm_hadd_ps(sum, sum);
-    sum = _mm_hadd_ps(sum, sum);
-    return _mm_cvtss_f32(sum);
+constexpr int kPackedMr = 16;
+constexpr int kPackedNr = 6;
+constexpr int kPackedMc = kPackedMr * 8 * 5;
+constexpr int kPackedNc = kPackedNr * 8 * 50;
+constexpr int kPackedKc = 500;
+
+struct PackedGemmScratch {
+    std::vector<float> blockA;
+    std::vector<float> blockB;
+};
+
+static thread_local PackedGemmScratch gPackedGemmScratch;
+
+static inline bool should_use_packed_gemm(std::size_t M, std::size_t N, std::size_t K) {
+    return M >= 32 && N >= 8 && K >= 128;
 }
+
+static inline std::size_t round_up_tiles(std::size_t value, std::size_t tile) {
+    return ((value + tile - 1) / tile) * tile;
+}
+
+static inline __m256i tail_mask8(int count) {
+    const __m256i idx = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+    return _mm256_cmpgt_epi32(_mm256_set1_epi32(count), idx);
+}
+
+static inline void build_store_masks(int mr, __m256i& mask0, __m256i& mask1) {
+    const int lo = std::min(mr, 8);
+    const int hi = std::max(mr - 8, 0);
+    mask0 = tail_mask8(lo);
+    mask1 = tail_mask8(hi);
+}
+
+static void pack_panel_a_colmajor(
+    const float* A,
+    float* packedA,
+    int mr,
+    int kc,
+    int lda)
+{
+    for (int p = 0; p < kc; ++p) {
+        for (int i = 0; i < mr; ++i) {
+            *packedA++ = A[p * lda + i];
+        }
+        for (int i = mr; i < kPackedMr; ++i) {
+            *packedA++ = 0.0f;
+        }
+    }
+}
+
+static void pack_block_a_colmajor(
+    const float* A,
+    float* packedA,
+    int mc,
+    int kc,
+    int lda)
+{
+    for (int i = 0; i < mc; i += kPackedMr) {
+        const int mr = std::min(kPackedMr, mc - i);
+        pack_panel_a_colmajor(A + i, packedA + i * kc, mr, kc, lda);
+    }
+}
+
+static void pack_panel_b_colmajor(
+    const float* B,
+    float* packedB,
+    int nr,
+    int kc,
+    int ldb)
+{
+    for (int p = 0; p < kc; ++p) {
+        for (int j = 0; j < nr; ++j) {
+            *packedB++ = B[j * ldb + p];
+        }
+        for (int j = nr; j < kPackedNr; ++j) {
+            *packedB++ = 0.0f;
+        }
+    }
+}
+
+static void pack_block_b_colmajor(
+    const float* B,
+    float* packedB,
+    int nc,
+    int kc,
+    int ldb)
+{
+    for (int j = 0; j < nc; j += kPackedNr) {
+        const int nr = std::min(kPackedNr, nc - j);
+        pack_panel_b_colmajor(B + j * ldb, packedB + j * kc, nr, kc, ldb);
+    }
+}
+
+template <int NRCols, bool LoadAccum>
+static inline void kernel_packed_16xN_colmajor(
+    const float* packedA,
+    const float* packedB,
+    float* C,
+    int mr,
+    int kc,
+    int ldc)
+{
+    std::array<__m256, NRCols> accLo{};
+    std::array<__m256, NRCols> accHi{};
+    __m256i mask0{};
+    __m256i mask1{};
+
+    if (mr != kPackedMr) {
+        build_store_masks(mr, mask0, mask1);
+    }
+
+    if constexpr (LoadAccum) {
+        for (int col = 0; col < NRCols; ++col) {
+            float* ccol = C + col * ldc;
+            if (mr == kPackedMr) {
+                accLo[col] = _mm256_loadu_ps(ccol);
+                accHi[col] = _mm256_loadu_ps(ccol + 8);
+            }
+            else {
+                accLo[col] = _mm256_maskload_ps(ccol, mask0);
+                accHi[col] = _mm256_maskload_ps(ccol + 8, mask1);
+            }
+        }
+    }
+    else {
+        for (int col = 0; col < NRCols; ++col) {
+            accLo[col] = _mm256_setzero_ps();
+            accHi[col] = _mm256_setzero_ps();
+        }
+    }
+
+    const float* aPtr = packedA;
+    const float* bPtr = packedB;
+    for (int p = 0; p < kc; ++p) {
+        const __m256 a0 = _mm256_loadu_ps(aPtr);
+        const __m256 a1 = _mm256_loadu_ps(aPtr + 8);
+        for (int col = 0; col < NRCols; ++col) {
+            const __m256 b = _mm256_broadcast_ss(bPtr + col);
+            accLo[col] = _mm256_fmadd_ps(a0, b, accLo[col]);
+            accHi[col] = _mm256_fmadd_ps(a1, b, accHi[col]);
+        }
+        aPtr += kPackedMr;
+        bPtr += kPackedNr;
+    }
+
+    for (int col = 0; col < NRCols; ++col) {
+        float* ccol = C + col * ldc;
+        if (mr == kPackedMr) {
+            _mm256_storeu_ps(ccol, accLo[col]);
+            _mm256_storeu_ps(ccol + 8, accHi[col]);
+        }
+        else {
+            _mm256_maskstore_ps(ccol, mask0, accLo[col]);
+            _mm256_maskstore_ps(ccol + 8, mask1, accHi[col]);
+        }
+    }
+}
+
+template <bool LoadAccum>
+static inline void dispatch_packed_kernel_colmajor(
+    const float* packedA,
+    const float* packedB,
+    float* C,
+    int mr,
+    int nr,
+    int kc,
+    int ldc)
+{
+    switch (nr) {
+    case 1:
+        kernel_packed_16xN_colmajor<1, LoadAccum>(packedA, packedB, C, mr, kc, ldc);
+        break;
+    case 2:
+        kernel_packed_16xN_colmajor<2, LoadAccum>(packedA, packedB, C, mr, kc, ldc);
+        break;
+    case 3:
+        kernel_packed_16xN_colmajor<3, LoadAccum>(packedA, packedB, C, mr, kc, ldc);
+        break;
+    case 4:
+        kernel_packed_16xN_colmajor<4, LoadAccum>(packedA, packedB, C, mr, kc, ldc);
+        break;
+    case 5:
+        kernel_packed_16xN_colmajor<5, LoadAccum>(packedA, packedB, C, mr, kc, ldc);
+        break;
+    case 6:
+        kernel_packed_16xN_colmajor<6, LoadAccum>(packedA, packedB, C, mr, kc, ldc);
+        break;
+    default:
+        break;
+    }
+}
+
+static void packed_gemm_colmajor_fp32(
+    float* C,
+    const float* A,
+    const float* B,
+    std::size_t M,
+    std::size_t N,
+    std::size_t K,
+    bool accumulate)
+{
+    if (M == 0 || N == 0) {
+        return;
+    }
+    if (K == 0) {
+        if (!accumulate) {
+            std::fill(C, C + M * N, 0.0f);
+        }
+        return;
+    }
+
+    auto& scratch = gPackedGemmScratch;
+    const std::size_t maxMc = std::min<std::size_t>(M, kPackedMc);
+    const std::size_t maxNc = std::min<std::size_t>(N, kPackedNc);
+    const std::size_t maxKc = std::min<std::size_t>(K, kPackedKc);
+    scratch.blockA.resize(round_up_tiles(maxMc, kPackedMr) * maxKc);
+    scratch.blockB.resize(round_up_tiles(maxNc, kPackedNr) * maxKc);
+
+    for (std::size_t j0 = 0; j0 < N; j0 += kPackedNc) {
+        const std::size_t nc = std::min<std::size_t>(kPackedNc, N - j0);
+
+        for (std::size_t p0 = 0; p0 < K; p0 += kPackedKc) {
+            const std::size_t kc = std::min<std::size_t>(kPackedKc, K - p0);
+            pack_block_b_colmajor(
+                B + j0 * K + p0,
+                scratch.blockB.data(),
+                static_cast<int>(nc),
+                static_cast<int>(kc),
+                static_cast<int>(K));
+
+            for (std::size_t i0 = 0; i0 < M; i0 += kPackedMc) {
+                const std::size_t mc = std::min<std::size_t>(kPackedMc, M - i0);
+                pack_block_a_colmajor(
+                    A + p0 * M + i0,
+                    scratch.blockA.data(),
+                    static_cast<int>(mc),
+                    static_cast<int>(kc),
+                    static_cast<int>(M));
+
+#if defined(_OPENMP)
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+                for (int jr = 0; jr < static_cast<int>(nc); jr += kPackedNr) {
+                    for (int ir = 0; ir < static_cast<int>(mc); ir += kPackedMr) {
+                        const int nr = std::min(kPackedNr, static_cast<int>(nc) - jr);
+                        const int mr = std::min(kPackedMr, static_cast<int>(mc) - ir);
+                        const float* packedATile = scratch.blockA.data() + static_cast<std::size_t>(ir) * kc;
+                        const float* packedBTile = scratch.blockB.data() + static_cast<std::size_t>(jr) * kc;
+                        float* cTile = C + (j0 + static_cast<std::size_t>(jr)) * M + (i0 + static_cast<std::size_t>(ir));
+                        if (p0 == 0 && !accumulate) {
+                            dispatch_packed_kernel_colmajor<false>(
+                                packedATile,
+                                packedBTile,
+                                cTile,
+                                mr,
+                                nr,
+                                static_cast<int>(kc),
+                                static_cast<int>(M));
+                        }
+                        else {
+                            dispatch_packed_kernel_colmajor<true>(
+                                packedATile,
+                                packedBTile,
+                                cTile,
+                                mr,
+                                nr,
+                                static_cast<int>(kc),
+                                static_cast<int>(M));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static inline void packed_gemm_rowmajor_fp32(
+    float* C,
+    const float* A,
+    const float* B,
+    std::size_t M,
+    std::size_t N,
+    std::size_t K,
+    bool accumulate = false)
+{
+    // Reinterpret row-major GEMM as a column-major GEMM on transposed views.
+    packed_gemm_colmajor_fp32(C, B, A, N, M, K, accumulate);
+}
+
+} // namespace
 
 // ===========================================================================
 // Helpers
@@ -166,6 +447,11 @@ void linear_THH(
     std::size_t H,
     std::size_t jTile)
 {
+    if (should_use_packed_gemm(T, H, H)) {
+        packed_gemm_rowmajor_fp32(Y, X, W, T, H, H, false);
+        return;
+    }
+
     std::fill(Y, Y + T * H, 0.0f);
 
     for (std::size_t j0 = 0; j0 < H; j0 += jTile) {
@@ -478,6 +764,353 @@ void linear_THH_fused_qkv_accum_blocked32(
     std::size_t T, std::size_t H, std::size_t jTile, std::size_t tTile)
 {
     linear_THH_fused_qkv_accum_blocked_impl<4>(Q, K, V, X, Wq, Wk, Wv, T, H, jTile, tTile);
+}
+
+// ===========================================================================
+// FFN GEMM helpers
+// ===========================================================================
+
+void linear_THF_fused_dual_accum_blocked32(
+    float* __restrict Y0,
+    float* __restrict Y1,
+    const float* __restrict X,
+    const float* __restrict W0,
+    const float* __restrict W1,
+    std::size_t T,
+    std::size_t H,
+    std::size_t F,
+    std::size_t fTile,
+    std::size_t tTile)
+{
+    if (should_use_packed_gemm(T, F, H)) {
+        packed_gemm_rowmajor_fp32(Y0, X, W0, T, F, H, false);
+        packed_gemm_rowmajor_fp32(Y1, X, W1, T, F, H, false);
+        return;
+    }
+
+    // Keep the dense FFN helper on a 4-row microtile even when the runtime
+    // BitNet activation tile is smaller; that improves FMA reuse without
+    // changing the quantized activation grouping used elsewhere.
+    const std::size_t ttMax = 4;
+    const std::size_t ft = (fTile == 0) ? 128 : std::max<std::size_t>(32, fTile);
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t0_i = 0; t0_i < static_cast<int>(T); t0_i += static_cast<int>(ttMax)) {
+        const std::size_t t0 = static_cast<std::size_t>(t0_i);
+        const std::size_t tt = std::min(ttMax, T - t0);
+
+        for (std::size_t f0 = 0; f0 < F; f0 += ft) {
+            const std::size_t f1 = std::min(F, f0 + ft);
+            std::size_t f = f0;
+
+            for (; f + 32 <= f1; f += 32) {
+                __m256 acc0[4][4], acc1[4][4];
+                for (std::size_t r = 0; r < tt; ++r) {
+                    for (int b = 0; b < 4; ++b) {
+                        acc0[r][b] = _mm256_setzero_ps();
+                        acc1[r][b] = _mm256_setzero_ps();
+                    }
+                }
+
+                for (std::size_t h = 0; h < H; ++h) {
+                    const float* w0row = W0 + h * F + f;
+                    const float* w1row = W1 + h * F + f;
+                    __m256 w0v[4], w1v[4];
+                    for (int b = 0; b < 4; ++b) {
+                        w0v[b] = _mm256_loadu_ps(w0row + 8 * b);
+                        w1v[b] = _mm256_loadu_ps(w1row + 8 * b);
+                    }
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const __m256 xv = _mm256_set1_ps(X[(t0 + r) * H + h]);
+                        for (int b = 0; b < 4; ++b) {
+                            acc0[r][b] = _mm256_fmadd_ps(xv, w0v[b], acc0[r][b]);
+                            acc1[r][b] = _mm256_fmadd_ps(xv, w1v[b], acc1[r][b]);
+                        }
+                    }
+                }
+
+                for (std::size_t r = 0; r < tt; ++r) {
+                    float* y0 = Y0 + (t0 + r) * F + f;
+                    float* y1 = Y1 + (t0 + r) * F + f;
+                    for (int b = 0; b < 4; ++b) {
+                        _mm256_storeu_ps(y0 + 8 * b, acc0[r][b]);
+                        _mm256_storeu_ps(y1 + 8 * b, acc1[r][b]);
+                    }
+                }
+            }
+            for (; f + 8 <= f1; f += 8) {
+                __m256 acc0[4], acc1[4];
+                for (std::size_t r = 0; r < tt; ++r) {
+                    acc0[r] = _mm256_setzero_ps();
+                    acc1[r] = _mm256_setzero_ps();
+                }
+
+                for (std::size_t h = 0; h < H; ++h) {
+                    const __m256 w0v = _mm256_loadu_ps(W0 + h * F + f);
+                    const __m256 w1v = _mm256_loadu_ps(W1 + h * F + f);
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const __m256 xv = _mm256_set1_ps(X[(t0 + r) * H + h]);
+                        acc0[r] = _mm256_fmadd_ps(xv, w0v, acc0[r]);
+                        acc1[r] = _mm256_fmadd_ps(xv, w1v, acc1[r]);
+                    }
+                }
+
+                for (std::size_t r = 0; r < tt; ++r) {
+                    _mm256_storeu_ps(Y0 + (t0 + r) * F + f, acc0[r]);
+                    _mm256_storeu_ps(Y1 + (t0 + r) * F + f, acc1[r]);
+                }
+            }
+
+            for (; f < f1; ++f) {
+                float acc0[4] = { 0, 0, 0, 0 };
+                float acc1[4] = { 0, 0, 0, 0 };
+                for (std::size_t h = 0; h < H; ++h) {
+                    const float w0s = W0[h * F + f];
+                    const float w1s = W1[h * F + f];
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const float xv = X[(t0 + r) * H + h];
+                        acc0[r] += xv * w0s;
+                        acc1[r] += xv * w1s;
+                    }
+                }
+                for (std::size_t r = 0; r < tt; ++r) {
+                    Y0[(t0 + r) * F + f] = acc0[r];
+                    Y1[(t0 + r) * F + f] = acc1[r];
+                }
+            }
+        }
+    }
+}
+
+void linear_TFH_accum_blocked32(
+    float* __restrict Y,
+    const float* __restrict X,
+    const float* __restrict W,
+    std::size_t T,
+    std::size_t F,
+    std::size_t H,
+    std::size_t hTile,
+    std::size_t tTile)
+{
+    if (should_use_packed_gemm(T, H, F)) {
+        packed_gemm_rowmajor_fp32(Y, X, W, T, H, F, false);
+        return;
+    }
+
+    // Match the fused gate/up helper so the FFN forward path stays on the
+    // same 4-row microtile width.
+    const std::size_t ttMax = 4;
+    const std::size_t ht = (hTile == 0) ? 128 : std::max<std::size_t>(32, hTile);
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t0_i = 0; t0_i < static_cast<int>(T); t0_i += static_cast<int>(ttMax)) {
+        const std::size_t t0 = static_cast<std::size_t>(t0_i);
+        const std::size_t tt = std::min(ttMax, T - t0);
+
+        for (std::size_t h0 = 0; h0 < H; h0 += ht) {
+            const std::size_t h1 = std::min(H, h0 + ht);
+            std::size_t h = h0;
+            for (; h + 32 <= h1; h += 32) {
+                __m256 acc[4][4];
+                for (std::size_t r = 0; r < tt; ++r) {
+                    for (int b = 0; b < 4; ++b) acc[r][b] = _mm256_setzero_ps();
+                }
+
+                for (std::size_t f = 0; f < F; ++f) {
+                    const float* wrow = W + f * H + h;
+                    __m256 wv[4];
+                    for (int b = 0; b < 4; ++b) wv[b] = _mm256_loadu_ps(wrow + 8 * b);
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const __m256 xv = _mm256_set1_ps(X[(t0 + r) * F + f]);
+                        for (int b = 0; b < 4; ++b) acc[r][b] = _mm256_fmadd_ps(xv, wv[b], acc[r][b]);
+                    }
+                }
+
+                for (std::size_t r = 0; r < tt; ++r) {
+                    float* y = Y + (t0 + r) * H + h;
+                    for (int b = 0; b < 4; ++b) _mm256_storeu_ps(y + 8 * b, acc[r][b]);
+                }
+            }
+
+            for (; h + 8 <= h1; h += 8) {
+                __m256 acc[4];
+                for (std::size_t r = 0; r < tt; ++r) acc[r] = _mm256_setzero_ps();
+
+                for (std::size_t f = 0; f < F; ++f) {
+                    const __m256 wv = _mm256_loadu_ps(W + f * H + h);
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const __m256 xv = _mm256_set1_ps(X[(t0 + r) * F + f]);
+                        acc[r] = _mm256_fmadd_ps(xv, wv, acc[r]);
+                    }
+                }
+
+                for (std::size_t r = 0; r < tt; ++r) {
+                    _mm256_storeu_ps(Y + (t0 + r) * H + h, acc[r]);
+                }
+            }
+
+            for (; h < h1; ++h) {
+                float acc[4] = { 0, 0, 0, 0 };
+                for (std::size_t f = 0; f < F; ++f) {
+                    const float ws = W[f * H + h];
+                    for (std::size_t r = 0; r < tt; ++r) acc[r] += X[(t0 + r) * F + f] * ws;
+                }
+                for (std::size_t r = 0; r < tt; ++r) {
+                    Y[(t0 + r) * H + h] = acc[r];
+                }
+            }
+        }
+    }
+}
+
+void linear_THF_from_FH_blocked4(
+    float* __restrict Y,
+    const float* __restrict X,
+    const float* __restrict W,
+    std::size_t T,
+    std::size_t H,
+    std::size_t F,
+    std::size_t fTile,
+    std::size_t tTile)
+{
+    const std::size_t ttMax = clamp_ttile(tTile);
+    const std::size_t ft = (fTile == 0) ? 128 : std::max<std::size_t>(32, fTile);
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t0_i = 0; t0_i < static_cast<int>(T); t0_i += static_cast<int>(ttMax)) {
+        const std::size_t t0 = static_cast<std::size_t>(t0_i);
+        const std::size_t tt = std::min(ttMax, T - t0);
+
+        for (std::size_t f0 = 0; f0 < F; f0 += ft) {
+            const std::size_t f1 = std::min(F, f0 + ft);
+            std::size_t f = f0;
+            for (; f + 4 <= f1; f += 4) {
+                __m256 accv[4][4];
+                float accs[4][4] = {};
+                for (std::size_t r = 0; r < tt; ++r) {
+                    for (int b = 0; b < 4; ++b) accv[r][b] = _mm256_setzero_ps();
+                }
+
+                const float* wrows[4] = {
+                    W + (f + 0) * H,
+                    W + (f + 1) * H,
+                    W + (f + 2) * H,
+                    W + (f + 3) * H
+                };
+
+                std::size_t h = 0;
+                for (; h + 8 <= H; h += 8) {
+                    __m256 wv[4] = {
+                        _mm256_loadu_ps(wrows[0] + h),
+                        _mm256_loadu_ps(wrows[1] + h),
+                        _mm256_loadu_ps(wrows[2] + h),
+                        _mm256_loadu_ps(wrows[3] + h)
+                    };
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const __m256 xv = _mm256_loadu_ps(X + (t0 + r) * H + h);
+                        for (int b = 0; b < 4; ++b) accv[r][b] = _mm256_fmadd_ps(xv, wv[b], accv[r][b]);
+                    }
+                }
+                for (; h < H; ++h) {
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const float xv = X[(t0 + r) * H + h];
+                        for (int b = 0; b < 4; ++b) accs[r][b] += xv * wrows[b][h];
+                    }
+                }
+
+                for (std::size_t r = 0; r < tt; ++r) {
+                    for (int b = 0; b < 4; ++b) {
+                        Y[(t0 + r) * F + f + b] = hsum256(accv[r][b]) + accs[r][b];
+                    }
+                }
+            }
+
+            for (; f < f1; ++f) {
+                __m256 accv[4];
+                float accs[4] = { 0, 0, 0, 0 };
+                for (std::size_t r = 0; r < tt; ++r) accv[r] = _mm256_setzero_ps();
+
+                std::size_t h = 0;
+                const float* wrow = W + f * H;
+                for (; h + 8 <= H; h += 8) {
+                    const __m256 wv = _mm256_loadu_ps(wrow + h);
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const __m256 xv = _mm256_loadu_ps(X + (t0 + r) * H + h);
+                        accv[r] = _mm256_fmadd_ps(xv, wv, accv[r]);
+                    }
+                }
+                for (; h < H; ++h) {
+                    for (std::size_t r = 0; r < tt; ++r) accs[r] += X[(t0 + r) * H + h] * wrow[h];
+                }
+                for (std::size_t r = 0; r < tt; ++r) {
+                    Y[(t0 + r) * F + f] = hsum256(accv[r]) + accs[r];
+                }
+            }
+        }
+    }
+}
+
+void linear_TFH_fused_dual_from_HF_blocked4(
+    float* __restrict Y,
+    const float* __restrict X0,
+    const float* __restrict X1,
+    const float* __restrict W0,
+    const float* __restrict W1,
+    std::size_t T,
+    std::size_t F,
+    std::size_t H,
+    std::size_t hTile,
+    std::size_t tTile)
+{
+    const std::size_t ttMax = clamp_ttile(tTile);
+    const std::size_t ht = (hTile == 0) ? 128 : std::max<std::size_t>(32, hTile);
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+    for (int t0_i = 0; t0_i < static_cast<int>(T); t0_i += static_cast<int>(ttMax)) {
+        const std::size_t t0 = static_cast<std::size_t>(t0_i);
+        const std::size_t tt = std::min(ttMax, T - t0);
+        for (std::size_t h0 = 0; h0 < H; h0 += ht) {
+            const std::size_t h1 = std::min(H, h0 + ht);
+            for (std::size_t h = h0; h < h1; ++h) {
+                const float* w0row = W0 + h * F;
+                const float* w1row = W1 + h * F;
+                __m256 accv[4];
+                float accs[4] = { 0, 0, 0, 0 };
+                for (std::size_t r = 0; r < tt; ++r) accv[r] = _mm256_setzero_ps();
+
+                std::size_t f = 0;
+                for (; f + 8 <= F; f += 8) {
+                    const __m256 w0v = _mm256_loadu_ps(w0row + f);
+                    const __m256 w1v = _mm256_loadu_ps(w1row + f);
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        const __m256 x0v = _mm256_loadu_ps(X0 + (t0 + r) * F + f);
+                        const __m256 x1v = _mm256_loadu_ps(X1 + (t0 + r) * F + f);
+                        __m256 sum = _mm256_mul_ps(x0v, w0v);
+                        sum = _mm256_fmadd_ps(x1v, w1v, sum);
+                        accv[r] = _mm256_add_ps(accv[r], sum);
+                    }
+                }
+                for (; f < F; ++f) {
+                    const float wsum0 = w0row[f];
+                    const float wsum1 = w1row[f];
+                    for (std::size_t r = 0; r < tt; ++r) {
+                        accs[r] += X0[(t0 + r) * F + f] * wsum0 + X1[(t0 + r) * F + f] * wsum1;
+                    }
+                }
+                for (std::size_t r = 0; r < tt; ++r) {
+                    Y[(t0 + r) * H + h] = hsum256(accv[r]) + accs[r];
+                }
+            }
+        }
+    }
 }
 
 // ===========================================================================
@@ -797,6 +1430,35 @@ void linear_THH_fused_qkv_bitnet_backward_dX_blocked32(
 // ===========================================================================
 // scale_inplace  (used by trainer to normalise dLogits)
 // ===========================================================================
+
+void axpy2_inplace_avx2_or_scalar(
+    float* y0,
+    const float* x0,
+    float* y1,
+    const float* x1,
+    std::size_t n,
+    float alpha)
+{
+    if (!y0 || !x0 || !y1 || !x1) throw std::runtime_error("axpy2_inplace_avx2_or_scalar: null pointer");
+    if (n == 0 || alpha == 0.0f) return;
+
+    const __m256 av = _mm256_set1_ps(alpha);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 x0v = _mm256_loadu_ps(x0 + i);
+        const __m256 x1v = _mm256_loadu_ps(x1 + i);
+        __m256 y0v = _mm256_loadu_ps(y0 + i);
+        __m256 y1v = _mm256_loadu_ps(y1 + i);
+        y0v = _mm256_fmadd_ps(av, x0v, y0v);
+        y1v = _mm256_fmadd_ps(av, x1v, y1v);
+        _mm256_storeu_ps(y0 + i, y0v);
+        _mm256_storeu_ps(y1 + i, y1v);
+    }
+    for (; i < n; ++i) {
+        y0[i] += alpha * x0[i];
+        y1[i] += alpha * x1[i];
+    }
+}
 
 void scale_inplace_avx2_or_scalar(float* data, std::size_t n, float scale)
 {

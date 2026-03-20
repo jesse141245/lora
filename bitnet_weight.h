@@ -22,6 +22,7 @@ struct BitNetMat {
 struct BitNetMatI2S {
     std::size_t rows = 0;
     std::size_t cols = 0;
+    bool hadamard32 = false;
 
     // Forward quantization / kernel layout
     std::size_t qk = 128;  // block size along rows (input dim)
@@ -68,8 +69,128 @@ struct BitNetMatI2S {
     }
 
     void clear() noexcept {
-        rows = 0; cols = 0; qk = 128; jq = 32;
+        rows = 0; cols = 0; hadamard32 = false; qk = 128; jq = 32;
         q2.clear(); q2T.clear(); w_scale_tile.clear(); w_scale_tileT.clear();
+    }
+};
+
+// ------------------------------------------------------------
+// Experimental BitNet TL2 forward container
+//
+// Generic AVX2 lookup-table path:
+// - use TL2-style 3-weight lookup groups over the largest prefix that is
+//   divisible by bk (default 96)
+// - use a smaller 2-weight lookup tail over the remaining 32/64 rows
+//
+// This container is forward-only for now. Backward still uses I2S.
+// ------------------------------------------------------------
+struct BitNetMatTL2 {
+    std::size_t rows = 0;
+    std::size_t cols = 0;
+    std::size_t bk = 96;
+    std::size_t tl2Rows = 0;
+    std::size_t tailRows = 0;
+
+    std::vector<uint8_t> tripleCodes; // [jBlock][kBlock][bk/3 groups][32 cols], low nibble = abs TL2 index, bit4 = sign
+    std::vector<uint8_t> pairCodes;   // [jBlock][tailRows/2 groups][32 cols]
+    std::vector<float> tripleScales;  // [jBlock][kBlock]
+    std::vector<float> tailScales;    // [jBlock]
+
+    bool empty() const noexcept {
+        return rows == 0 || cols == 0 || tripleCodes.empty();
+    }
+
+    std::size_t nJBlocks() const noexcept {
+        return cols / 32;
+    }
+
+    std::size_t nTl2Blocks() const noexcept {
+        return (bk == 0) ? 0 : (tl2Rows / bk);
+    }
+
+    std::size_t tripleGroupsPerBlock() const noexcept {
+        return bk / 3;
+    }
+
+    std::size_t tailPairGroups() const noexcept {
+        return tailRows / 2;
+    }
+
+    std::size_t tripleBlockBytes() const noexcept {
+        return tripleGroupsPerBlock() * 32;
+    }
+
+    void clear() noexcept {
+        rows = 0;
+        cols = 0;
+        bk = 96;
+        tl2Rows = 0;
+        tailRows = 0;
+        tripleCodes.clear();
+        pairCodes.clear();
+        tripleScales.clear();
+        tailScales.clear();
+    }
+};
+
+// ------------------------------------------------------------
+// Microsoft-style shape-specialized TL2 container
+//
+// Layout matches the generated x86 TL2 kernels:
+// - triple-prefix absolute-code bytes
+// - triple-prefix sign bytes
+// - optional two-weight tail bytes
+// - one per-tensor scale
+// ------------------------------------------------------------
+struct BitNetMatTL2Gen {
+    std::size_t rows = 0;      // input dim (K)
+    std::size_t cols = 0;      // output dim (M)
+    std::size_t bm = 0;        // output tile
+    std::size_t bk = 96;       // TL2 three-weight block
+    std::size_t threeK = 0;    // largest prefix handled by TL2
+    std::size_t twoK = 0;      // 32/64-weight tail
+    std::size_t nTileNum = 0;  // cols / bm
+    float scale = 1.0f;        // fallback/global scale
+    std::vector<float> tileScales; // optional per-output-tile scales
+    std::vector<uint8_t> qweights;
+    BitNetMatI2S i2sMain;
+    float residualScale = 1.0f; // optional second-stage fallback/global scale
+    std::vector<float> residualTileScales;
+    std::vector<uint8_t> residualQweights;
+    BitNetMatI2S i2sResidualStage;
+    BitNetMatI2S i2sResidual;
+    std::size_t denseResidualRowsPerTile = 0;
+    std::vector<uint16_t> denseResidualRowIdx;
+    std::vector<float> denseResidualWeights;
+
+    bool empty() const noexcept {
+        return rows == 0 || cols == 0 || bm == 0 || qweights.empty();
+    }
+
+    bool hasResidual() const noexcept {
+        return !residualQweights.empty();
+    }
+
+    void clear() noexcept {
+        rows = 0;
+        cols = 0;
+        bm = 0;
+        bk = 96;
+        threeK = 0;
+        twoK = 0;
+        nTileNum = 0;
+        scale = 1.0f;
+        tileScales.clear();
+        qweights.clear();
+        i2sMain.clear();
+        residualScale = 1.0f;
+        residualTileScales.clear();
+        residualQweights.clear();
+        i2sResidualStage.clear();
+        i2sResidual.clear();
+        denseResidualRowsPerTile = 0;
+        denseResidualRowIdx.clear();
+        denseResidualWeights.clear();
     }
 };
 

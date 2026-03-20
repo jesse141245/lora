@@ -14,8 +14,8 @@
  * @param H Hidden dimension size.
  * @param nHeads Number of Attention Heads for Queries.
  * @param nKvHeads Number of Attention Heads for Keys/Values (enables GQA/MQA).
- * @param scores Output buffer for raw Q*K^T logits (size T x T).
- * @param probs Output buffer for post-softmax probabilities (size T x T).
+ * @param scores Output buffer for raw Q*K^T logits (size nHeads x T x T).
+ * @param probs Output buffer for post-softmax probabilities (size nHeads x T x T).
  * @param attentionMask Pointer to the padding mask array (0 to ignore, 1 to keep) (size T).
  */
 void attn_causal(
@@ -46,7 +46,7 @@ void attn_causal(
  * @param H Hidden dimension size.
  * @param nHeads Number of Attention Heads for Queries.
  * @param nKvHeads Number of Attention Heads for Keys/Values.
- * @param probs Original attention probabilities from forward pass (size T x T).
+ * @param probs Original attention probabilities from forward pass (size nHeads x T x T).
  * @param attentionMask Pointer to the padding mask array (size T).
  * @param tmp_dP Scratch buffer for intermediate softmax gradient calculations (size T).
  */

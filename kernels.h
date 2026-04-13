@@ -62,6 +62,14 @@ void rmsnorm_backward(
     std::size_t H,
     float eps);
 
+void rmsnorm_backward_accum(
+    float* __restrict dx_accum,
+    const float* __restrict g,
+    const float* __restrict x,
+    const float* __restrict gamma,
+    std::size_t H,
+    float eps);
+
 // ===========================================================================
 // Dense Linear Algebra (Float32)
 // ===========================================================================
@@ -142,65 +150,6 @@ void lora_add_H(
     std::size_t hTile);
 
 // ===========================================================================
-// Fused QKV Forward (Float32)
-// ===========================================================================
-
-/**
- * @brief Baseline fused projection for Query, Key, and Value matrices.
- * @param Q Output Query matrix (size T x H).
- * @param K Output Key matrix (size T x kvDim).
- * @param V Output Value matrix (size T x kvDim).
- * @param X Input hidden states (size T x H).
- * @param Wq Query weights.
- * @param Wk Key weights.
- * @param Wv Value weights.
- * @param T Sequence length.
- * @param H Hidden dimension size.
- * @param jTile Cache blocking size (width).
- * @param tTile Cache blocking size (time).
- */
-void linear_THH_fused_qkv(
-    float* __restrict Q, float* __restrict K, float* __restrict V,
-    const float* __restrict X,
-    const float* __restrict Wq, const float* __restrict Wk, const float* __restrict Wv,
-    std::size_t T, std::size_t H,
-    std::size_t jTile,
-    std::size_t tTile);
-
-/**
- * @brief Accumulation variant of the fused QKV projection.
- */
-void linear_THH_fused_qkv_accum(
-    float* __restrict Q, float* __restrict K, float* __restrict V,
-    const float* __restrict X,
-    const float* __restrict Wq, const float* __restrict Wk, const float* __restrict Wv,
-    std::size_t T, std::size_t H,
-    std::size_t jTile,
-    std::size_t tTile);
-
-/**
- * @brief Highly optimized, 16-element AVX2 blocked fused QKV projection.
- */
-void linear_THH_fused_qkv_accum_blocked16(
-    float* __restrict Q, float* __restrict K, float* __restrict V,
-    const float* __restrict X,
-    const float* __restrict Wq, const float* __restrict Wk, const float* __restrict Wv,
-    std::size_t T, std::size_t H,
-    std::size_t jTile,
-    std::size_t tTile);
-
-/**
- * @brief Highly optimized, 32-element AVX2 blocked fused QKV projection.
- */
-void linear_THH_fused_qkv_accum_blocked32(
-    float* __restrict Q, float* __restrict K, float* __restrict V,
-    const float* __restrict X,
-    const float* __restrict Wq, const float* __restrict Wk, const float* __restrict Wv,
-    std::size_t T, std::size_t H,
-    std::size_t jTile,
-    std::size_t tTile);
-
-// ===========================================================================
 // FFN GEMM Helpers
 // ===========================================================================
 
@@ -266,116 +215,6 @@ void linear_TFH_fused_dual_from_HF_blocked4(
     std::size_t F,
     std::size_t H,
     std::size_t hTile,
-    std::size_t tTile);
-
-// ===========================================================================
-// QKV Input Backward (Float32)
-// ===========================================================================
-
-/**
- * @brief Computes the gradient of the input X with respect to the Q, K, and V gradients.
- * Effectively: dX = dQ * Wq^T + dK * Wk^T + dV * Wv^T.
- * @param dX Output gradient for the input (size T x H).
- * @param dQ Incoming gradient for Queries.
- * @param dK Incoming gradient for Keys.
- * @param dV Incoming gradient for Values.
- * @param Wq Query weights.
- * @param Wk Key weights.
- * @param Wv Value weights.
- * @param T Sequence length.
- * @param H Hidden dimension size.
- * @param hTile Cache blocking size.
- */
-void qkv_input_backward_THH(
-    float* __restrict dX,
-    const float* __restrict dQ,
-    const float* __restrict dK,
-    const float* __restrict dV,
-    const float* __restrict Wq,
-    const float* __restrict Wk,
-    const float* __restrict Wv,
-    std::size_t T, std::size_t H,
-    std::size_t hTile);
-
-// ===========================================================================
-// BitNet (1.58-bit Ternary) Kernels
-// ===========================================================================
-
-/**
- * @brief Performs a linear projection using BitNet ternary quantized weights.
- * @param Y Output matrix (size T x H).
- * @param X Input matrix (size T x H).
- * @param Wq BitNet quantized weight matrix containing scales and ternary int8 values.
- * @param T Sequence length.
- * @param H Hidden dimension size.
- * @param jTile Cache blocking size.
- */
-void linear_THH_bitnet(
-    float* __restrict Y,
-    const float* __restrict X,
-    const BitNetMat& Wq,
-    std::size_t T,
-    std::size_t H,
-    std::size_t jTile);
-
-/**
- * @brief Computes the input gradient (dX) for the QKV projections using BitNet weights.
- * @param dX Output gradient for the input (size T x H).
- * @param dQ Incoming Query gradient.
- * @param dK Incoming Key gradient.
- * @param dV Incoming Value gradient.
- * @param Wq BitNet Query weights.
- * @param Wk BitNet Key weights.
- * @param Wv BitNet Value weights.
- * @param T Sequence length.
- * @param H Hidden dimension size.
- * @param hTile Cache blocking size.
- */
-void qkv_input_backward_THH_bitnet(
-    float* __restrict dX,
-    const float* __restrict dQ,
-    const float* __restrict dK,
-    const float* __restrict dV,
-    const BitNetMat& Wq,
-    const BitNetMat& Wk,
-    const BitNetMat& Wv,
-    std::size_t T,
-    std::size_t H,
-    std::size_t hTile);
-
-/**
- * @brief Fused QKV forward pass using BitNet ternary weights, blocked for AVX2.
- */
-void linear_THH_fused_qkv_bitnet_accum_blocked32(
-    float* __restrict Q, float* __restrict K, float* __restrict V,
-    const float* __restrict X,
-    const BitNetMat& WqM, const BitNetMat& WkM, const BitNetMat& WvM,
-    std::size_t T, std::size_t H,
-    std::size_t jTile,
-    std::size_t tTile);
-
-/**
- * @brief Accumulates the result of a transposed matrix-vector multiplication using BitNet weights.
- */
-void linear_HH_T_accum_bitnet(
-    float* __restrict y,
-    const float* __restrict A,
-    const BitNetMat& WoM,
-    std::size_t H,
-    std::size_t hTile);
-
-/**
- * @brief Backward pass for BitNet fused QKV, specifically generating the dX gradient, optimized with AVX2 blocking.
- */
-void linear_THH_fused_qkv_bitnet_backward_dX_blocked32(
-    float* __restrict dX,
-    const float* __restrict dQ,
-    const float* __restrict dK,
-    const float* __restrict dV,
-    const BitNetMat& WqM, const BitNetMat& WkM, const BitNetMat& WvM,
-    std::size_t T, std::size_t H,
-    const int* __restrict attentionMask,
-    std::size_t iTile,
     std::size_t tTile);
 
 // ===========================================================================
@@ -568,6 +407,50 @@ inline void axpy_x4_inplace_avx2_or_scalar(
         y2[i] += alpha2 * xv;
         y3[i] += alpha3 * xv;
     }
+}
+
+inline void copy_avx2_or_scalar(
+    float* dst,
+    const float* src,
+    std::size_t n)
+{
+    if (!dst || !src) throw std::runtime_error("copy_avx2_or_scalar: null pointer");
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        _mm256_storeu_ps(dst + i, _mm256_loadu_ps(src + i));
+    }
+    for (; i < n; ++i) dst[i] = src[i];
+}
+
+inline void add_inplace_avx2_or_scalar(
+    float* dst,
+    const float* src,
+    std::size_t n)
+{
+    if (!dst || !src) throw std::runtime_error("add_inplace_avx2_or_scalar: null pointer");
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 dv = _mm256_loadu_ps(dst + i);
+        const __m256 sv = _mm256_loadu_ps(src + i);
+        _mm256_storeu_ps(dst + i, _mm256_add_ps(dv, sv));
+    }
+    for (; i < n; ++i) dst[i] += src[i];
+}
+
+inline void add_to_out_avx2_or_scalar(
+    float* out,
+    const float* a,
+    const float* b,
+    std::size_t n)
+{
+    if (!out || !a || !b) throw std::runtime_error("add_to_out_avx2_or_scalar: null pointer");
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 av = _mm256_loadu_ps(a + i);
+        const __m256 bv = _mm256_loadu_ps(b + i);
+        _mm256_storeu_ps(out + i, _mm256_add_ps(av, bv));
+    }
+    for (; i < n; ++i) out[i] = a[i] + b[i];
 }
 
 /**

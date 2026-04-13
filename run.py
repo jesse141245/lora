@@ -25,7 +25,7 @@ CPP_TRAINER_EXE = os.path.abspath("x64/Release/qlora_test.exe")
 LORA_RAW_BIN    = os.path.abspath("./lora_output.bin")
 LORA_GGUF_OUT   = os.path.abspath("./bitnet_adapter.gguf")
 
-MAX_SEQ_LEN = 64   # must match cfg.maxSeqLen in main.cpp
+MAX_SEQ_LEN = 256  # must match cfg.maxSeqLen in main.cpp
 IGNORE_IDX  = -100
 
 # ==============================================================================
@@ -151,8 +151,11 @@ def build_sample_with_prompt_mask(tokenizer, instruction: str, response: str,
     positions never contribute to the loss or gradients.
     """
     # Build the two text spans
-    prompt_text = f"User: {instruction}\nAssistant: "
-    answer_part = f"{response}"
+    # Keep the prompt boundary tokenizer-stable. Tokenizing "Assistant: "
+    # separately can produce a standalone space token that merges into the
+    # first answer token in the full sequence, shifting supervision by one.
+    prompt_text = f"User: {instruction}\nAssistant:"
+    answer_part = f" {response}"
     if short_explanation:
         answer_part += f" {short_explanation}"
     full_text = prompt_text + answer_part

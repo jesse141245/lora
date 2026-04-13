@@ -19,6 +19,35 @@ namespace fs = std::filesystem;
 
 namespace {
 
+std::optional<std::string> getEnvStringRaw(const char* name) {
+#if defined(_WIN32)
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || !value || len == 0 || value[0] == '\0') {
+        if (value) {
+            std::free(value);
+        }
+        return std::nullopt;
+    }
+    std::string out(value);
+    std::free(value);
+    return out;
+#else
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') {
+        return std::nullopt;
+    }
+    return std::string(value);
+#endif
+}
+
+std::string lowerCopy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
 std::size_t normalizeBitNetQk(int value, std::size_t fallback) {
     if (value <= 0) return fallback;
     const int clamped = std::max(32, value);
@@ -26,10 +55,10 @@ std::size_t normalizeBitNetQk(int value, std::size_t fallback) {
 }
 
 std::optional<int> getEnvInt(const char* name) {
-    const char* value = std::getenv(name);
-    if (!value || *value == '\0') return std::nullopt;
+    const auto value = getEnvStringRaw(name);
+    if (!value) return std::nullopt;
     try {
-        return std::stoi(value);
+        return std::stoi(*value);
     }
     catch (...) {
         return std::nullopt;
@@ -37,10 +66,10 @@ std::optional<int> getEnvInt(const char* name) {
 }
 
 std::optional<float> getEnvFloat(const char* name) {
-    const char* value = std::getenv(name);
-    if (!value || *value == '\0') return std::nullopt;
+    const auto value = getEnvStringRaw(name);
+    if (!value) return std::nullopt;
     try {
-        return std::stof(value);
+        return std::stof(*value);
     }
     catch (...) {
         return std::nullopt;
@@ -48,17 +77,17 @@ std::optional<float> getEnvFloat(const char* name) {
 }
 
 std::optional<bool> getEnvBool(const char* name) {
-    const char* value = std::getenv(name);
-    if (!value || *value == '\0') return std::nullopt;
-
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
+    const auto value = getEnvStringRaw(name);
+    if (!value) return std::nullopt;
+    const std::string s = lowerCopy(*value);
 
     if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
     if (s == "0" || s == "false" || s == "no" || s == "off") return false;
     return std::nullopt;
+}
+
+std::optional<std::string> getEnvString(const char* name) {
+    return getEnvStringRaw(name);
 }
 
 } // namespace
@@ -82,8 +111,11 @@ int main() {
         std::cout << "OpenMP threads: " << omp_get_max_threads() << "\n";
 #endif
 
-        const std::string model_path = "./test_model";
-        const std::string dataset_path = "./test_dataset.jsonl";
+        const std::string model_path = getEnvString("QLORA_TEST_MODEL_PATH").value_or("./test_model");
+        const std::string dataset_path = getEnvString("QLORA_TEST_DATASET_PATH").value_or(
+            fs::exists("./tests/overfit_tutor_dataset.jsonl")
+                ? "./tests/overfit_tutor_dataset.jsonl"
+                : "./test_dataset.jsonl");
 
         std::cout << "[1/2] Configuring Trainer...\n";
         TrainerConfig cfg;
@@ -91,19 +123,19 @@ int main() {
         cfg.loraOutputPath = std::filesystem::absolute("lora_output.bin").string();
         cfg.checkpointDir = std::filesystem::absolute("checkpoints").string();
 
-        cfg.maxSeqLen = 64;      // avoid truncating all current training samples
-        cfg.batchSize = 2;       // increase micro-batch for stabler gradients
-        cfg.gradAccumSteps = 2;  // effective batch = 4
-        cfg.maxSteps = 200;
+        cfg.maxSeqLen = 256;     // leave room for longer tutoring-style examples
+        cfg.batchSize = 1;       // seq256 tutor runs are memory/bandwidth heavy
+        cfg.gradAccumSteps = 4;  // smaller effective batch than the old supTokens~8 sweeps
+        cfg.maxSteps = 500;
         // Full-depth training (0 = all model layers).
         cfg.forcedLayers = 0;
 
         // Higher-capacity adapter for SFT alignment.
-        cfg.loraRank = 32;
-        cfg.loraAlpha = 32.0f; // keep alpha ~= rank
+        cfg.loraRank = 64;
+        cfg.loraAlpha = 64.0f; // keep alpha ~= rank
 
         // Short warmup then constant LR for small-data overfit behavior.
-        cfg.learningRate = 3e-5f;
+        cfg.learningRate = 3e-3f;
         cfg.warmupSteps = -1;
         cfg.useCosineDecay = false;
         cfg.useAdamW = true; // set false to use Lion
@@ -148,6 +180,12 @@ int main() {
         }
         if (const auto v = getEnvInt("QLORA_TEST_T_TILE")) {
             cfg.tTile = static_cast<std::size_t>(std::max(1, *v));
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_H_TILE")) {
+            cfg.hTile = static_cast<std::size_t>(std::max(1, *v));
+        }
+        if (const auto v = getEnvInt("QLORA_TEST_V_TILE")) {
+            cfg.vTile = static_cast<std::size_t>(std::max(1, *v));
         }
         if (const auto v = getEnvInt("QLORA_TEST_LORA_RANK")) {
             cfg.loraRank = static_cast<std::size_t>(std::max(1, *v));
@@ -262,7 +300,9 @@ int main() {
             << " checkpointInterval=" << cfg.checkpointInterval
             << " loraRank=" << cfg.loraRank
             << " loraAlpha=" << cfg.loraAlpha
+            << " hTile=" << cfg.hTile
             << " tTile=" << cfg.tTile
+            << " vTile=" << cfg.vTile
             << " actClipRms=" << bitnetActClipRms
             << " bitnetQK=" << cfg.bitnetQK
             << " bitnetFfnQK=" << (cfg.bitnetFfnQK == 0 ? cfg.bitnetQK : cfg.bitnetFfnQK)

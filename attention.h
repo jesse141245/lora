@@ -14,7 +14,8 @@
  * @param H Hidden dimension size.
  * @param nHeads Number of Attention Heads for Queries.
  * @param nKvHeads Number of Attention Heads for Keys/Values (enables GQA/MQA).
- * @param scores Output buffer for raw Q*K^T logits (size nHeads x T x T).
+ * @param scores Optional output buffer for raw Q*K^T logits (size nHeads x T x T).
+ *        May be null when only probabilities are needed.
  * @param probs Output buffer for post-softmax probabilities (size nHeads x T x T).
  * @param attentionMask Pointer to the padding mask array (0 to ignore, 1 to keep) (size T).
  */

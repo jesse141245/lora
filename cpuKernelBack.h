@@ -173,12 +173,12 @@ private:
 
     // ── Persistent scratch buffers (avoids per-step heap churn) ──────────────
     // Sized once in the constructor; reused every forward/backward call.
-    std::vector<int8_t> fwdX8Scratch_;      // tTile * H
-    std::vector<float>  fwdXScaleScratch_;  // tTile * max(nKBlocks across all mats)
-    std::vector<int8_t> bwdDY8Scratch_;     // tTile * max(out-dim) for LM-head bwd
-    std::vector<float>  bwdDYScaleScratch_; // tTile * max(nJBlocks across all mats)
-    std::vector<int8_t> bwdDK8Scratch_;     // tTile * max(kvDim, ffnDim) for fused bwd paths
-    std::vector<float>  bwdDKScaleScratch_; // tTile * ceil(max(kvDim, ffnDim)/jq)
-    std::vector<int8_t> bwdDV8Scratch_;     // tTile * max(kvDim, ffnDim) for fused bwd paths
-    std::vector<float>  bwdDVScaleScratch_; // tTile * ceil(max(kvDim, ffnDim)/jq)
+    std::vector<int8_t> fwdX8Scratch_;      // forward scratch rows * max input dim
+    std::vector<float>  fwdXScaleScratch_;  // forward scratch rows * max(nKBlocks across mats)
+    std::vector<int8_t> bwdDY8Scratch_;     // backward scratch rows * max(out-dim)
+    std::vector<float>  bwdDYScaleScratch_; // backward scratch rows * max(nJBlocks)
+    std::vector<int8_t> bwdDK8Scratch_;     // backward scratch rows * max(kvDim, ffnDim)
+    std::vector<float>  bwdDKScaleScratch_; // backward scratch rows * ceil(max(kvDim, ffnDim)/jq)
+    std::vector<int8_t> bwdDV8Scratch_;     // backward scratch rows * max(kvDim, ffnDim)
+    std::vector<float>  bwdDVScaleScratch_; // backward scratch rows * ceil(max(kvDim, ffnDim)/jq)
 };

@@ -10,6 +10,10 @@
 #include <string>
 #include <vector>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #define GGML_BITNET_X86_TL2
 #include "qlora_tl2_kernels.h"
 #include "bitnet_i2_s.h"
@@ -48,9 +52,23 @@ enum class Tl2ScaleMode {
 };
 
 std::optional<std::string> tryGetEnvString(const char* name) {
+#if defined(_WIN32)
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || !value || len == 0 || value[0] == '\0') {
+        if (value) {
+            std::free(value);
+        }
+        return std::nullopt;
+    }
+    std::string out(value);
+    std::free(value);
+    return out;
+#else
     const char* value = std::getenv(name);
     if (!value || *value == '\0') return std::nullopt;
     return std::string(value);
+#endif
 }
 
 std::string lowerCopy(std::string s) {
@@ -119,6 +137,72 @@ std::size_t parseQkString(const std::optional<std::string>& value, std::size_t f
     catch (...) {
         return fallback;
     }
+}
+
+std::size_t tl2GeneratedForwardChunkRows(std::size_t T) {
+    const auto value = tryGetEnvString("QLORA_TEST_BITNET_TL2_FORWARD_CHUNK_ROWS");
+    if (!value) {
+        return T >= 128 ? std::size_t{64} : std::size_t{0};
+    }
+    try {
+        const int parsed = std::stoi(*value);
+        if (parsed <= 0) {
+            return 0;
+        }
+        return std::min<std::size_t>(T, static_cast<std::size_t>(parsed));
+    }
+    catch (...) {
+        return 0;
+    }
+}
+
+bool tl2GeneratedParallelForwardChunksEnabled(std::size_t T, std::size_t chunkRows) {
+    if (const auto value = tryGetEnvString("QLORA_TEST_BITNET_TL2_FORWARD_PARALLEL_CHUNKS")) {
+        return parseBoolString(value, false);
+    }
+    return T >= 128 && chunkRows > 0 && chunkRows < T;
+}
+
+std::size_t tl2GeneratedI2STTile(std::size_t T) {
+    const auto value = tryGetEnvString("QLORA_TEST_BITNET_TL2_I2S_T_TILE");
+    if (value.has_value()) {
+        try {
+            const std::size_t parsed = std::stoull(*value);
+            if (parsed == 2 || parsed == 4) {
+                return parsed;
+            }
+        }
+        catch (...) {
+        }
+    }
+    return T >= 128 ? 4u : 2u;
+}
+
+int tl2GeneratedStageMaxBatch() {
+    const auto value = tryGetEnvString("QLORA_TEST_BITNET_TL2_STAGE_MAX_BATCH");
+    if (!value) {
+        return 512;
+    }
+    try {
+        const int parsed = std::stoi(*value);
+        if (parsed >= 1) {
+            return parsed;
+        }
+    }
+    catch (...) {
+    }
+    return 512;
+}
+
+bool tl2GeneratedI2SOverwriteForwardEnabled(std::size_t T, std::size_t tTile) {
+    if (const auto skipFill = tryGetEnvString("QLORA_TEST_BITNET_TL2_I2S_SKIP_FILL")) {
+        return parseBoolString(skipFill, false);
+    }
+    const auto value = tryGetEnvString("QLORA_TEST_BITNET_FUSED_X4_FORWARD");
+    if (value) {
+        return parseBoolString(value, false);
+    }
+    return tTile >= 4 && T >= 128;
 }
 
 struct Tl2RuntimeOptions {
@@ -617,9 +701,13 @@ void tl2_generated_stage_forward(
     const uint8_t* sign = qweights + threeAbsBytes;
     const uint8_t* twoA = qweights + twoBase;
     constexpr int batchSizes[] = { 512, 256, 128, 32, 8, 1 };
+    const int maxBatch = tl2GeneratedStageMaxBatch();
     std::size_t start = 0;
 
     for (int bs : batchSizes) {
+        if (bs > maxBatch) {
+            continue;
+        }
         while (start + static_cast<std::size_t>(bs) <= T) {
             void* scaleArg = tileScales
                 ? const_cast<float*>(tileScales)
@@ -650,6 +738,69 @@ void tl2_generated_stage_forward(
             start += static_cast<std::size_t>(bs);
         }
     }
+}
+
+void tl2_generated_apply_dense_residual(
+    float* __restrict Y,
+    const float* __restrict X,
+    const BitNetMatTL2Gen& W,
+    std::size_t T)
+{
+    if (W.denseResidualRowsPerTile == 0 || W.denseResidualWeights.empty() || W.denseResidualRowIdx.empty()) {
+        return;
+    }
+
+    const std::size_t rowsPerTile = W.denseResidualRowsPerTile;
+    const std::size_t bm = W.bm;
+
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(T > 1)
+#endif
+    for (ptrdiff_t t = 0; t < static_cast<ptrdiff_t>(T); ++t) {
+        const float* xRow = X + t * W.rows;
+        float* yRow = Y + t * W.cols;
+        for (std::size_t tile = 0; tile < W.nTileNum; ++tile) {
+            float* yTile = yRow + tile * bm;
+            for (std::size_t s = 0; s < rowsPerTile; ++s) {
+                const uint16_t rowIdx = W.denseResidualRowIdx[tile * rowsPerTile + s];
+                if (rowIdx == 0xffffu || rowIdx >= W.rows) {
+                    continue;
+                }
+                const float xv = xRow[rowIdx];
+                if (xv == 0.0f) {
+                    continue;
+                }
+                const float* wRow = W.denseResidualWeights.data() + (tile * rowsPerTile + s) * bm;
+                axpy_inplace_avx2_or_scalar(yTile, wRow, bm, xv);
+            }
+        }
+    }
+}
+
+void tl2_generated_apply_i2s_residual(
+    float* __restrict Y,
+    const float* __restrict X,
+    const BitNetMatTL2Gen& W,
+    std::size_t T)
+{
+    if (W.i2sResidual.empty()) {
+        return;
+    }
+
+    const std::size_t tTile = tl2GeneratedI2STTile(T);
+    const std::size_t nKBlocks = W.i2sResidual.nKBlocks();
+    thread_local std::vector<int8_t> x8Scratch;
+    thread_local std::vector<float> xScaleScratch;
+    x8Scratch.resize(tTile * W.rows);
+    xScaleScratch.resize(tTile * nKBlocks);
+    linear_forward_bitnet_i2s_accum(
+        Y,
+        X,
+        W.i2sResidual,
+        T,
+        tTile,
+        x8Scratch.data(),
+        xScaleScratch.data());
 }
 
 } // namespace
@@ -786,9 +937,14 @@ void linear_forward_bitnet_tl2_generated(
     }
 
     if (!W.i2sMain.empty()) {
-        std::fill(Y, Y + T * W.cols, 0.0f);
-
-        const std::size_t tTile = 2;
+        const std::size_t tTile = tl2GeneratedI2STTile(T);
+        const bool overwriteFirstBlock = tl2GeneratedI2SOverwriteForwardEnabled(T, tTile);
+        if (!overwriteFirstBlock) {
+            std::fill(Y, Y + T * W.cols, 0.0f);
+        }
+        else if (const std::size_t tailRows = T % tTile; tailRows != 0) {
+            std::fill(Y + (T - tailRows) * W.cols, Y + T * W.cols, 0.0f);
+        }
         const std::size_t mainKBlocks = W.i2sMain.nKBlocks();
         thread_local std::vector<int8_t> x8Scratch;
         thread_local std::vector<float> xScaleScratch;
@@ -804,8 +960,7 @@ void linear_forward_bitnet_tl2_generated(
             xScaleScratch.data());
 
         if (!W.i2sResidualStage.empty()) {
-            const std::size_t residualStageKBlocks = W.i2sResidualStage.nKBlocks();
-            xScaleScratch.resize(tTile * residualStageKBlocks);
+            xScaleScratch.resize(tTile * W.i2sResidualStage.nKBlocks());
             linear_forward_bitnet_i2s_accum(
                 Y,
                 X,
@@ -823,81 +978,151 @@ void linear_forward_bitnet_tl2_generated(
 
     std::fill(Y, Y + T * W.cols, 0.0f);
 
-    std::vector<int8_t> threeQLut(std::max<std::size_t>(1, T * (W.threeK / 3) * 32));
-    std::vector<int8_t> twoQLut(std::max<std::size_t>(1, T * (W.twoK / 2) * 32));
-    std::vector<float> lutScales(T, 0.0f);
+    thread_local std::vector<int8_t> threeQLut;
+    thread_local std::vector<int8_t> twoQLut;
+    thread_local std::vector<float> lutScales;
 
-    ggml_preprocessor(
-        static_cast<int>(T),
-        m,
-        threeK,
-        twoK,
-        const_cast<float*>(X),
-        lutScales.data(),
-        threeQLut.data(),
-        twoQLut.data());
-    tl2_generated_stage_forward(
-        Y,
-        W,
-        W.qweights.data(),
-        W.tileScales.empty() ? nullptr : W.tileScales.data(),
-        W.scale,
-        threeQLut,
-        twoQLut,
-        lutScales,
-        T);
-    if (W.hasResidual()) {
+    const std::size_t chunkRowsRequested = tl2GeneratedForwardChunkRows(T);
+    const std::size_t chunkRows =
+        (chunkRowsRequested == 0 || chunkRowsRequested >= T)
+        ? T
+        : chunkRowsRequested;
+    const bool parallelChunks = tl2GeneratedParallelForwardChunksEnabled(T, chunkRows);
+    const std::size_t chunkCount = (T + chunkRows - 1) / chunkRows;
+
+ #if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(parallelChunks)
+#endif
+    for (ptrdiff_t chunkIndex = 0; chunkIndex < static_cast<ptrdiff_t>(chunkCount); ++chunkIndex) {
+        const std::size_t t0 = static_cast<std::size_t>(chunkIndex) * chunkRows;
+        const std::size_t rows = std::min(chunkRows, T - t0);
+        const float* xChunk = X + t0 * W.rows;
+        float* yChunk = Y + t0 * W.cols;
+
+        threeQLut.resize(std::max<std::size_t>(1, rows * (W.threeK / 3) * 32));
+        twoQLut.resize(std::max<std::size_t>(1, rows * (W.twoK / 2) * 32));
+        lutScales.resize(rows);
+
+        ggml_preprocessor(
+            static_cast<int>(rows),
+            m,
+            threeK,
+            twoK,
+            const_cast<float*>(xChunk),
+            lutScales.data(),
+            threeQLut.data(),
+            twoQLut.data());
         tl2_generated_stage_forward(
-            Y,
+            yChunk,
             W,
-            W.residualQweights.data(),
-            W.residualTileScales.empty() ? nullptr : W.residualTileScales.data(),
-            W.residualScale,
+            W.qweights.data(),
+            W.tileScales.empty() ? nullptr : W.tileScales.data(),
+            W.scale,
             threeQLut,
             twoQLut,
             lutScales,
-            T);
-    }
-    }
-
-    if (W.denseResidualRowsPerTile != 0 && !W.denseResidualWeights.empty() && !W.denseResidualRowIdx.empty()) {
-        const std::size_t rowsPerTile = W.denseResidualRowsPerTile;
-        const std::size_t bm = W.bm;
-        for (std::size_t t = 0; t < T; ++t) {
-            const float* xRow = X + t * W.rows;
-            float* yRow = Y + t * W.cols;
-            for (std::size_t tile = 0; tile < W.nTileNum; ++tile) {
-                float* yTile = yRow + tile * bm;
-                for (std::size_t s = 0; s < rowsPerTile; ++s) {
-                    const uint16_t rowIdx = W.denseResidualRowIdx[tile * rowsPerTile + s];
-                    if (rowIdx == 0xffffu || rowIdx >= W.rows) {
-                        continue;
-                    }
-                    const float xv = xRow[rowIdx];
-                    if (xv == 0.0f) {
-                        continue;
-                    }
-                    const float* wRow = W.denseResidualWeights.data() + (tile * rowsPerTile + s) * bm;
-                    axpy_inplace_avx2_or_scalar(yTile, wRow, bm, xv);
-                }
-            }
+            rows);
+        if (W.hasResidual()) {
+            tl2_generated_stage_forward(
+                yChunk,
+                W,
+                W.residualQweights.data(),
+                W.residualTileScales.empty() ? nullptr : W.residualTileScales.data(),
+                W.residualScale,
+                threeQLut,
+                twoQLut,
+                lutScales,
+                rows);
         }
     }
+    }
 
-    if (!W.i2sResidual.empty()) {
-        const std::size_t tTile = 2;
-        const std::size_t nKBlocks = W.i2sResidual.nKBlocks();
+    tl2_generated_apply_dense_residual(Y, X, W, T);
+    tl2_generated_apply_i2s_residual(Y, X, W, T);
+}
+
+void linear_fused_dual_forward_bitnet_tl2_generated(
+    float* __restrict Ya,
+    float* __restrict Yb,
+    const float* __restrict X,
+    const BitNetMatTL2Gen& Wa,
+    const BitNetMatTL2Gen& Wb,
+    std::size_t T)
+{
+    if (!Ya || !Yb || !X || Wa.empty() || Wb.empty() || T == 0) {
+        throw std::runtime_error("linear_fused_dual_forward_bitnet_tl2_generated: invalid input");
+    }
+
+    if (Wa.i2sMain.empty() || Wb.i2sMain.empty() ||
+        Wa.i2sMain.rows != Wb.i2sMain.rows ||
+        Wa.i2sMain.qk != Wb.i2sMain.qk ||
+        Wa.i2sMain.jq != Wb.i2sMain.jq ||
+        Wa.i2sMain.hadamard32 != Wb.i2sMain.hadamard32) {
+        linear_forward_bitnet_tl2_generated(Ya, X, Wa, T);
+        linear_forward_bitnet_tl2_generated(Yb, X, Wb, T);
+        return;
+    }
+
+    const std::size_t tTile = tl2GeneratedI2STTile(T);
+    const bool overwriteFirstBlock = tl2GeneratedI2SOverwriteForwardEnabled(T, tTile);
+    if (!overwriteFirstBlock) {
+        std::fill(Ya, Ya + T * Wa.cols, 0.0f);
+        std::fill(Yb, Yb + T * Wb.cols, 0.0f);
+    }
+    else if (const std::size_t tailRows = T % tTile; tailRows != 0) {
+        std::fill(Ya + (T - tailRows) * Wa.cols, Ya + T * Wa.cols, 0.0f);
+        std::fill(Yb + (T - tailRows) * Wb.cols, Yb + T * Wb.cols, 0.0f);
+    }
+    const std::size_t nKBlocks = Wa.i2sMain.nKBlocks();
+    thread_local std::vector<int8_t> x8Scratch;
+    thread_local std::vector<float> xScaleScratch;
+    x8Scratch.resize(tTile * Wa.rows);
+    xScaleScratch.resize(tTile * nKBlocks);
+
+    linear_fused_mixed_dual_forward_bitnet_i2s_accum(
+        Ya, Yb, X, Wa.i2sMain, Wb.i2sMain, T, tTile, x8Scratch.data(), xScaleScratch.data());
+
+    if (!Wa.i2sResidualStage.empty()) {
+        xScaleScratch.resize(tTile * Wa.i2sResidualStage.nKBlocks());
+        linear_forward_bitnet_i2s_accum(Ya, X, Wa.i2sResidualStage, T, tTile, x8Scratch.data(), xScaleScratch.data());
+    }
+    if (!Wb.i2sResidualStage.empty()) {
+        xScaleScratch.resize(tTile * Wb.i2sResidualStage.nKBlocks());
+        linear_forward_bitnet_i2s_accum(Yb, X, Wb.i2sResidualStage, T, tTile, x8Scratch.data(), xScaleScratch.data());
+    }
+
+    tl2_generated_apply_dense_residual(Ya, X, Wa, T);
+    tl2_generated_apply_i2s_residual(Ya, X, Wa, T);
+    tl2_generated_apply_dense_residual(Yb, X, Wb, T);
+    tl2_generated_apply_i2s_residual(Yb, X, Wb, T);
+}
+
+void linear_forward_bitnet_tl2_generated_residual_only(
+    float* __restrict Y,
+    const float* __restrict X,
+    const BitNetMatTL2Gen& W,
+    std::size_t T)
+{
+    if (!Y || !X || W.empty() || T == 0) {
+        throw std::runtime_error("linear_forward_bitnet_tl2_generated_residual_only: invalid input");
+    }
+
+    if (!W.i2sResidualStage.empty()) {
+        const std::size_t tTile = tl2GeneratedI2STTile(T);
         thread_local std::vector<int8_t> x8Scratch;
         thread_local std::vector<float> xScaleScratch;
         x8Scratch.resize(tTile * W.rows);
-        xScaleScratch.resize(tTile * nKBlocks);
+        xScaleScratch.resize(tTile * W.i2sResidualStage.nKBlocks());
         linear_forward_bitnet_i2s_accum(
             Y,
             X,
-            W.i2sResidual,
+            W.i2sResidualStage,
             T,
             tTile,
             x8Scratch.data(),
             xScaleScratch.data());
     }
+
+    tl2_generated_apply_dense_residual(Y, X, W, T);
+    tl2_generated_apply_i2s_residual(Y, X, W, T);
 }

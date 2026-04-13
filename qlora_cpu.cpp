@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <filesystem>
 #include <cmath> // For std::sqrt
+#include <optional>
+#include <string>
 
 namespace {
 
@@ -26,34 +28,56 @@ struct LogitStats {
     bool hasNonFinite = false;
 };
 
-bool logitsDebugEnabled() {
-    const char* value = std::getenv("QLORA_DEBUG_LOGITS");
-    if (!value || *value == '\0') return false;
-    std::string s(value);
+std::optional<std::string> tryGetEnvString(const char* name) {
+#if defined(_WIN32)
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || !value || len == 0 || value[0] == '\0') {
+        if (value) {
+            std::free(value);
+        }
+        return std::nullopt;
+    }
+    std::string out(value);
+    std::free(value);
+    return out;
+#else
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') {
+        return std::nullopt;
+    }
+    return std::string(value);
+#endif
+}
+
+std::string lowerCopy(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
     });
-    return s == "1" || s == "true" || s == "yes" || s == "on";
+    return s;
+}
+
+bool envBoolOr(const char* name, bool fallback) {
+    const auto value = tryGetEnvString(name);
+    if (!value) {
+        return fallback;
+    }
+    const std::string s = lowerCopy(*value);
+    if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
+    if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+    return fallback;
+}
+
+bool logitsDebugEnabled() {
+    return envBoolOr("QLORA_DEBUG_LOGITS", false);
 }
 
 bool logitsValidationEnabled() {
-    const char* value = std::getenv("QLORA_VALIDATE_LOGITS");
-    if (!value || *value == '\0') return logitsDebugEnabled();
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s == "1" || s == "true" || s == "yes" || s == "on";
+    return envBoolOr("QLORA_VALIDATE_LOGITS", logitsDebugEnabled());
 }
 
 bool loraNormDebugEnabled() {
-    const char* value = std::getenv("QLORA_DEBUG_LORA_NORMS");
-    if (!value || *value == '\0') return false;
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s == "1" || s == "true" || s == "yes" || s == "on";
+    return envBoolOr("QLORA_DEBUG_LORA_NORMS", false);
 }
 
 bool quantizedLmHeadBackwardEnabled(const TrainerConfig& cfg) {
@@ -63,10 +87,10 @@ bool quantizedLmHeadBackwardEnabled(const TrainerConfig& cfg) {
 }
 
 float logitAbsThreshold() {
-    const char* value = std::getenv("QLORA_LOGIT_ABS_LIMIT");
-    if (!value || *value == '\0') return 1.0e6f;
+    const auto value = tryGetEnvString("QLORA_LOGIT_ABS_LIMIT");
+    if (!value) return 1.0e6f;
     try {
-        return std::stof(value);
+        return std::stof(*value);
     }
     catch (...) {
         return 1.0e6f;

@@ -50,6 +50,9 @@
     <ConfigurationType>Application</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>ClangCL</PlatformToolset>
+    <LLVMInstallDir>C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64</LLVMInstallDir>
+    <LLVMToolsVersion>19.1.5</LLVMToolsVersion>
+    <LLVMIncludeVersion>19</LLVMIncludeVersion>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -128,7 +131,6 @@
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
-      <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
       <FloatingPointModel>Fast</FloatingPointModel>
       <OpenMPSupport>true</OpenMPSupport>
       <AdditionalIncludeDirectories>$(ProjectDir)external\json\include;$(ProjectDir)BitNet\include;$(ProjectDir)BitNet\3rdparty\llama.cpp\ggml\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>

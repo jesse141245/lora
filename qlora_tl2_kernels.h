@@ -17,13 +17,6 @@ static void * aligned_malloc(size_t size) {
 #endif
 }
 
-static void aligned_free(void * ptr) {
-#if defined(_WIN32)
-    _aligned_free(ptr);
-#else
-    free(ptr);
-#endif
-}
 #define BK2 32
 #if defined __AVX2__
 inline void _mm256_merge_epi32(const __m256i v0, const __m256i v1, __m256i *vl, __m256i *vh)
@@ -277,9 +270,6 @@ template<int batch_size, int K3>
 inline void three_tbl_impl_2560_6912(int32_t* c, int8_t* lut, uint8_t* a, uint8_t* sign) {
 #ifdef __AVX2__
     const __m256i vec_mask = _mm256_set1_epi8(0x0f);
-    const __m256i vec_sign_mask  = _mm256_set1_epi16(0x8000);
-    const __m256i vec_zero  = _mm256_set1_epi8(0x00);
-    const __m256i vec_one  = _mm256_set1_epi8(0xff);
     const int KK = BBK2560_6912 / 3;
 #pragma unroll
         for (int i = 0; i < BM2560_6912; i += 32) {
@@ -521,9 +511,6 @@ template<int batch_size, int K3>
 inline void three_tbl_impl_6912_2560(int32_t* c, int8_t* lut, uint8_t* a, uint8_t* sign) {
 #ifdef __AVX2__
     const __m256i vec_mask = _mm256_set1_epi8(0x0f);
-    const __m256i vec_sign_mask  = _mm256_set1_epi16(0x8000);
-    const __m256i vec_zero  = _mm256_set1_epi8(0x00);
-    const __m256i vec_one  = _mm256_set1_epi8(0xff);
     const int KK = BBK6912_2560 / 3;
 #pragma unroll
         for (int i = 0; i < BM6912_2560; i += 32) {
@@ -765,9 +752,6 @@ template<int batch_size, int K3>
 inline void three_tbl_impl_2560_2560(int32_t* c, int8_t* lut, uint8_t* a, uint8_t* sign) {
 #ifdef __AVX2__
     const __m256i vec_mask = _mm256_set1_epi8(0x0f);
-    const __m256i vec_sign_mask  = _mm256_set1_epi16(0x8000);
-    const __m256i vec_zero  = _mm256_set1_epi8(0x00);
-    const __m256i vec_one  = _mm256_set1_epi8(0xff);
     const int KK = BBK2560_2560 / 3;
 #pragma unroll
         for (int i = 0; i < BM2560_2560; i += 32) {
@@ -1009,9 +993,6 @@ template<int batch_size, int K3>
 inline void three_tbl_impl_640_2560(int32_t* c, int8_t* lut, uint8_t* a, uint8_t* sign) {
 #ifdef __AVX2__
     const __m256i vec_mask = _mm256_set1_epi8(0x0f);
-    const __m256i vec_sign_mask  = _mm256_set1_epi16(0x8000);
-    const __m256i vec_zero  = _mm256_set1_epi8(0x00);
-    const __m256i vec_one  = _mm256_set1_epi8(0xff);
     const int KK = BBK640_2560 / 3;
 #pragma unroll
         for (int i = 0; i < BM640_2560; i += 32) {

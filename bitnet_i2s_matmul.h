@@ -29,7 +29,9 @@ void linear_forward_bitnet_i2s_accum(
     std::size_t T,
     std::size_t tTile,
     int8_t* __restrict x8Scratch,
-    float* __restrict xScaleScratch
+    float* __restrict xScaleScratch,
+    const int* attentionMask = nullptr,
+    std::size_t activePrefixT = static_cast<std::size_t>(-1)
 );
 
 // ------------------------------------------------------------
@@ -66,7 +68,25 @@ void linear_fused_dual_forward_bitnet_i2s_accum(
     std::size_t T,
     std::size_t tTile,
     int8_t* __restrict x8Scratch,
-    float* __restrict xScaleScratch
+    float* __restrict xScaleScratch,
+    const int* attentionMask = nullptr,
+    std::size_t activePrefixT = static_cast<std::size_t>(-1)
+);
+
+// Fused forward computation for two projections that share the same input
+// shape and quantization layout but may have different output dims.
+void linear_fused_mixed_dual_forward_bitnet_i2s_accum(
+    float* __restrict Ya,
+    float* __restrict Yb,
+    const float* __restrict X,
+    const BitNetMatI2S& Wa,
+    const BitNetMatI2S& Wb,
+    std::size_t T,
+    std::size_t tTile,
+    int8_t* __restrict x8Scratch,
+    float* __restrict xScaleScratch,
+    const int* attentionMask = nullptr,
+    std::size_t activePrefixT = static_cast<std::size_t>(-1)
 );
 
 // ------------------------------------------------------------
@@ -83,7 +103,10 @@ void linear_backward_bitnet_i2s_packed(
     std::size_t T,
     std::size_t tTile,
     int8_t* __restrict dy8Scratch,
-    float* __restrict dyScaleScratch
+    float* __restrict dyScaleScratch,
+    const int* attentionMask = nullptr,
+    std::size_t activePrefixT = static_cast<std::size_t>(-1),
+    bool destStartsZero = false
 );
 
 // ------------------------------------------------------------
@@ -127,5 +150,8 @@ void linear_fused_dual_backward_bitnet_i2s_packed(
     int8_t* __restrict dyA8Scratch,
     float* __restrict dyAScaleScratch,
     int8_t* __restrict dyB8Scratch,
-    float* __restrict dyBScaleScratch
+    float* __restrict dyBScaleScratch,
+    const int* attentionMask = nullptr,
+    std::size_t activePrefixT = static_cast<std::size_t>(-1),
+    bool destStartsZero = false
 );

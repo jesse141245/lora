@@ -1,6 +1,7 @@
 ﻿#include "cpuKernelBack.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -12,6 +13,8 @@
 #include <cstring>
 #include <filesystem>
 #include <cmath>
+#include <optional>
+#include <string>
 
 #include <nlohmann/json.hpp>
 
@@ -31,6 +34,54 @@
 namespace {
 
 using ProfileClock = std::chrono::steady_clock;
+
+std::optional<std::string> tryGetEnvString(const char* name) {
+#if defined(_WIN32)
+    char* value = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&value, &len, name) != 0 || !value || len == 0 || value[0] == '\0') {
+        if (value) {
+            std::free(value);
+        }
+        return std::nullopt;
+    }
+    std::string out(value);
+    std::free(value);
+    return out;
+#else
+    const char* value = std::getenv(name);
+    if (!value || *value == '\0') {
+        return std::nullopt;
+    }
+    return std::string(value);
+#endif
+}
+
+std::string lowerCopy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    return s;
+}
+
+bool envStringTruthy(const std::string& s) {
+    return s == "1" || s == "true" || s == "yes" || s == "on";
+}
+
+bool envStringFalsy(const std::string& s) {
+    return s == "0" || s == "false" || s == "no" || s == "off";
+}
+
+std::optional<bool> envBoolOverride(const char* name) {
+    const auto value = tryGetEnvString(name);
+    if (!value) {
+        return std::nullopt;
+    }
+    return envStringTruthy(lowerCopy(*value));
+}
+
+bool envBoolOr(const char* name, bool fallback);
+std::size_t envSizeTOr(const char* name, std::size_t fallback);
 
 struct BackendProfileState {
     double fwdEmbedMs = 0.0;
@@ -52,6 +103,10 @@ struct BackendProfileState {
     double bwdClearMs = 0.0;
     double bwdRestoreMs = 0.0;
     double bwdFfnMs = 0.0;
+    double bwdFfnWdownMs = 0.0;
+    double bwdFfnSiluMs = 0.0;
+    double bwdFfnDualMs = 0.0;
+    double bwdFfnNormMs = 0.0;
     double bwdWoMs = 0.0;
     double bwdAttnMs = 0.0;
     double bwdRopeMs = 0.0;
@@ -63,80 +118,336 @@ struct BackendProfileState {
 };
 
 bool backendProfileEnabled() {
-    static const bool enabled = []() {
-        const char* value = std::getenv("QLORA_PROFILE_BACKEND");
-        if (!value || *value == '\0') return false;
-        std::string s(value);
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return s == "1" || s == "true" || s == "yes" || s == "on";
-    }();
+    static const bool enabled = envBoolOr("QLORA_PROFILE_BACKEND", false);
     return enabled;
 }
 
 bool fastSiluForwardEnabled() {
-    static const bool enabled = []() {
-        const char* value = std::getenv("QLORA_TEST_FAST_SILU_FWD");
-        if (!value || *value == '\0') return false;
-        std::string s(value);
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return s == "1" || s == "true" || s == "yes" || s == "on";
-    }();
+    static const bool enabled = envBoolOr("QLORA_TEST_FAST_SILU_FWD", false);
     return enabled;
 }
 
 bool fastSiluBackwardEnabled() {
-    static const bool enabled = []() {
-        const char* value = std::getenv("QLORA_TEST_FAST_SILU_BWD");
-        if (!value || *value == '\0') return false;
-        std::string s(value);
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return s == "1" || s == "true" || s == "yes" || s == "on";
-    }();
+    static const bool enabled = envBoolOr("QLORA_TEST_FAST_SILU_BWD", false);
     return enabled;
 }
 
+bool exactSiluBackwardChunkedEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_EXACT_SILU_BWD_CHUNKED", false);
+    return cached;
+}
+
+bool exactMaskedTileSkipEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_I2S_MASK_SKIP", false);
+    return cached;
+}
+
+bool prefixMaskFastpathEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_PREFIX_MASK_FASTPATH", false);
+    return cached;
+}
+
+bool activePrefixComputeEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_ACTIVE_PREFIX_COMPUTE", false);
+    return cached;
+}
+
+bool rmsnormBackwardAccumEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_RMSNORM_BWD_ACCUM", false);
+    return cached;
+}
+
+bool parallelRmsnormForwardEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_PARALLEL_RMSNORM_FWD", false);
+    return cached;
+}
+
+bool tl2GeneratedCallerFillsEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_TL2_GENERATED_CALLER_FILLS", false);
+    return cached;
+}
+
+bool fusedTl2GeneratedQVEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_TL2_FUSED_QV_GEN", false);
+    return cached;
+}
+
+bool fusedTl2GeneratedHybridQkvEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_TL2_FUSED_HYBRID_QKV", false);
+    return cached;
+}
+
+bool attentionStoreScoresEnabled() {
+    static const bool cached = envBoolOr("QLORA_TEST_ATTN_STORE_SCORES", true);
+    return cached;
+}
+
+std::optional<bool> parallelAttentionPrepOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_PARALLEL_ATTN_PREP");
+    return cached;
+}
+
+bool parallelAttentionPrepEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = parallelAttentionPrepOverride()) {
+        return *forced;
+    }
+
+    // Long-sequence tutor runs spend enough time in LoRA prep + RoPE to
+    // justify the extra OpenMP region. Shorter runs still keep the old default.
+    return activeComputeT >= 128;
+}
+
+std::optional<bool> fusedQkvForwardOverwriteOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_BITNET_FUSED_QKV_FORWARD_OVERWRITE");
+    return cached;
+}
+
+bool fusedQkvForwardOverwriteEnabled(std::size_t activeComputeT, std::size_t tTile) {
+    if (const std::optional<bool> forced = fusedQkvForwardOverwriteOverride()) {
+        return *forced;
+    }
+
+    return tTile >= 4 && activeComputeT >= 128;
+}
+
+std::optional<bool> parallelAttentionLoraBackwardOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_PARALLEL_ATTN_LORA_BWD");
+    return cached;
+}
+
+bool parallelAttentionLoraBackwardEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = parallelAttentionLoraBackwardOverride()) {
+        return *forced;
+    }
+
+    return activeComputeT >= 128;
+}
+
+std::size_t contiguousActivePrefixLength(std::span<const int> attentionMask) {
+    bool sawZero = false;
+    std::size_t activePrefixT = 0;
+    for (std::size_t t = 0; t < attentionMask.size(); ++t) {
+        if (attentionMask[t] != 0) {
+            if (sawZero) {
+                return static_cast<std::size_t>(-1);
+            }
+            activePrefixT = t + 1;
+        }
+        else {
+            sawZero = true;
+        }
+    }
+    return activePrefixT;
+}
+
 bool ffnGemmEnabled() {
-    static const bool enabled = []() {
-        const char* value = std::getenv("QLORA_TEST_FFN_GEMM");
-        if (!value || *value == '\0') return false;
-        std::string s(value);
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return s == "1" || s == "true" || s == "yes" || s == "on";
-    }();
+    static const bool enabled = envBoolOr("QLORA_TEST_FFN_GEMM", false);
     return enabled;
 }
 
 bool ffnBitnetEnabled() {
-    static const bool enabled = []() {
-        const char* value = std::getenv("QLORA_TEST_BITNET_FFN");
-        if (!value || *value == '\0') return true;
-        std::string s(value);
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        return s == "1" || s == "true" || s == "yes" || s == "on";
-    }();
+    static const bool enabled = envBoolOr("QLORA_TEST_BITNET_FFN", true);
     return enabled;
 }
 
 bool envBoolOr(const char* name, bool fallback) {
-    const char* value = std::getenv(name);
-    if (!value || *value == '\0') return fallback;
-    std::string s(value);
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
-    if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+    const auto value = tryGetEnvString(name);
+    if (!value) return fallback;
+    const std::string s = lowerCopy(*value);
+    if (envStringTruthy(s)) return true;
+    if (envStringFalsy(s)) return false;
     return fallback;
+}
+
+std::size_t envSizeTOr(const char* name, std::size_t fallback) {
+    const auto value = tryGetEnvString(name);
+    if (!value) return fallback;
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value->c_str(), &end, 10);
+    if (end == value->c_str() || parsed == 0) return fallback;
+    return static_cast<std::size_t>(parsed);
+}
+
+bool bitnetFfnStreamedPrefixBackwardEnabled() {
+    static const bool enabled =
+        envBoolOr("QLORA_TEST_BITNET_FFN_BWD_STREAM_PREFIX", false);
+    return enabled;
+}
+
+std::optional<bool> fusedAttentionNormCacheWriteOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_FUSED_ATTN_NORM_CACHE_WRITE");
+    return cached;
+}
+
+bool fusedAttentionNormCacheWriteEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = fusedAttentionNormCacheWriteOverride()) {
+        return *forced;
+    }
+
+    return activeComputeT >= 128;
+}
+
+std::optional<bool> fusedAttentionQkvCacheWriteOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_FUSED_ATTN_QKV_CACHE_WRITE");
+    return cached;
+}
+
+bool fusedAttentionQkvCacheWriteEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = fusedAttentionQkvCacheWriteOverride()) {
+        return *forced;
+    }
+
+    return activeComputeT >= 128;
+}
+
+std::optional<bool> directAttentionBackwardCacheOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_DIRECT_ATTN_BWD_CACHE");
+    return cached;
+}
+
+bool directAttentionBackwardCacheEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = directAttentionBackwardCacheOverride()) {
+        return *forced;
+    }
+
+    return activeComputeT >= 128 && fusedAttentionQkvCacheWriteEnabled(activeComputeT);
+}
+
+std::optional<bool> directFfnBackwardCacheOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_DIRECT_FFN_BWD_CACHE");
+    return cached;
+}
+
+bool directFfnBackwardCacheEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = directFfnBackwardCacheOverride()) {
+        return *forced;
+    }
+
+    return activeComputeT >= 128;
+}
+
+std::optional<bool> woBackwardOverwriteOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_WO_BWD_OVERWRITE");
+    return cached;
+}
+
+bool woBackwardOverwriteEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = woBackwardOverwriteOverride()) {
+        return *forced;
+    }
+
+    return activeComputeT >= 128;
+}
+
+std::optional<bool> groupedAttentionBackwardKvPreclearOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_ATTN_GROUP_LOCAL_SKIP_KV_PRECLEAR");
+    return cached;
+}
+
+bool groupedAttentionBackwardKvPreclearEnabled(
+    std::size_t activeComputeT,
+    std::size_t nHeads,
+    std::size_t nKvHeads)
+{
+    if (const std::optional<bool> forced = groupedAttentionBackwardKvPreclearOverride()) {
+        return *forced;
+    }
+
+    return activeComputeT >= 128 &&
+        nHeads > nKvHeads &&
+        envBoolOr("QLORA_TEST_ATTN_BWD_GROUP_LOCAL_ACCUM", true);
+}
+
+std::size_t bitnetFfnStreamedPrefixBackwardChunkT(std::size_t fallback) {
+    return envSizeTOr("QLORA_TEST_BITNET_FFN_BWD_STREAM_CHUNK_T", fallback);
+}
+
+std::size_t bitnetDualBackwardQuantChunkRows(std::size_t fallback) {
+    return envSizeTOr("QLORA_TEST_BITNET_DUAL_BWD_QUANT_CHUNK_ROWS", fallback);
+}
+
+std::size_t exactFusedQkvForwardTileRows(std::size_t activeComputeT, std::size_t fallback) {
+    const std::size_t promoted =
+        (activeComputeT >= 128 && fallback >= 4)
+        ? std::max<std::size_t>(fallback, 16)
+        : fallback;
+    return envSizeTOr("QLORA_TEST_BITNET_FUSED_QKV_FORWARD_TILE_ROWS", promoted);
+}
+
+std::size_t exactWdownBackwardTileRows(std::size_t activeComputeT, std::size_t fallback) {
+    const std::size_t promoted =
+        (activeComputeT >= 128 && fallback >= 4)
+        ? std::max<std::size_t>(fallback, 16)
+        : fallback;
+    return envSizeTOr("QLORA_TEST_BITNET_WDOWN_BWD_TILE_ROWS", promoted);
+}
+
+std::size_t exactLmHeadBackwardTileRows(std::size_t activeComputeT, std::size_t fallback) {
+    const std::size_t promoted =
+        (activeComputeT >= 128 && fallback >= 4)
+        ? std::max<std::size_t>(fallback, 256)
+        : fallback;
+    return envSizeTOr("QLORA_TEST_BITNET_LM_HEAD_BWD_TILE_ROWS", promoted);
+}
+
+std::size_t exactFusedQkvBackwardTileRows(std::size_t activeComputeT, std::size_t fallback) {
+    const std::size_t promoted =
+        (activeComputeT >= 128 && fallback >= 4)
+        ? std::max<std::size_t>(fallback, 32)
+        : fallback;
+    return envSizeTOr("QLORA_TEST_BITNET_FUSED_QKV_BACKWARD_TILE_ROWS", promoted);
+}
+
+std::optional<bool> ffnBackwardFuseResidualAddOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_FFN_BWD_FUSE_RESIDUAL_ADD");
+    return cached;
+}
+
+bool ffnBackwardFuseResidualAddEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = ffnBackwardFuseResidualAddOverride()) {
+        return *forced;
+    }
+
+    return activeComputeT >= 128;
+}
+
+std::optional<bool> exactChunkedFfnBackwardOverride() {
+    static const std::optional<bool> cached = envBoolOverride("QLORA_TEST_BITNET_FFN_BWD_CHUNKED");
+    return cached;
+}
+
+bool exactChunkedFfnBackwardEnabled(std::size_t activeComputeT) {
+    if (const std::optional<bool> forced = exactChunkedFfnBackwardOverride()) {
+        return *forced;
+    }
+
+    return false;
+}
+
+std::size_t exactChunkedFfnBackwardRows(std::size_t activeComputeT, std::size_t fallback) {
+    const std::size_t promoted =
+        (exactChunkedFfnBackwardEnabled(activeComputeT) && fallback >= 4)
+        ? std::max<std::size_t>(fallback, 32)
+        : fallback;
+    return envSizeTOr("QLORA_TEST_BITNET_FFN_BWD_CHUNK_ROWS", promoted);
+}
+
+std::size_t backwardScratchRows(std::size_t activeComputeT, std::size_t tTile) {
+    std::size_t rows = tTile;
+
+    if (bitnetFfnStreamedPrefixBackwardEnabled()) {
+        rows = std::max(rows, bitnetFfnStreamedPrefixBackwardChunkT(32));
+    }
+
+    // The long-sequence exact FFN dual-backward path can quantize more rows
+    // than cfg_.tTile when single-team master quant is active.
+    rows = std::max(rows, bitnetDualBackwardQuantChunkRows(4));
+    rows = std::max(rows, exactLmHeadBackwardTileRows(activeComputeT, tTile));
+    rows = std::max(rows, exactWdownBackwardTileRows(activeComputeT, tTile));
+    rows = std::max(rows, exactFusedQkvBackwardTileRows(activeComputeT, tTile));
+    rows = std::max(rows, exactChunkedFfnBackwardRows(activeComputeT, tTile));
+
+    return rows;
 }
 
 bool tl2QEnabled(const TrainerConfig& cfg) {
@@ -215,6 +526,10 @@ void printBackendProfile() {
         << " clear=" << p.bwdClearMs
         << " restore=" << p.bwdRestoreMs
         << " ffn=" << p.bwdFfnMs
+        << " ffn_wdown=" << p.bwdFfnWdownMs
+        << " ffn_silu=" << p.bwdFfnSiluMs
+        << " ffn_dual=" << p.bwdFfnDualMs
+        << " ffn_norm=" << p.bwdFfnNormMs
         << " wo=" << p.bwdWoMs
         << " attn=" << p.bwdAttnMs
         << " rope=" << p.bwdRopeMs
@@ -494,6 +809,48 @@ static inline void silu_backward_exact_scalar(
     }
 }
 
+static inline void silu_backward_exact_chunked(
+    float* __restrict dGate,
+    float* __restrict dUp,
+    const float* __restrict dAct,
+    const float* __restrict gate,
+    const float* __restrict up,
+    std::size_t T,
+    std::size_t F,
+    const int* __restrict attentionMask)
+{
+    static constexpr std::size_t kChunk = 256;
+    const std::size_t nChunks = (F + kChunk - 1) / kChunk;
+
+#if defined(_OPENMP)
+#pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
+        for (int c_i = 0; c_i < static_cast<int>(nChunks); ++c_i) {
+            const std::size_t t = static_cast<std::size_t>(t_i);
+            const std::size_t chunk = static_cast<std::size_t>(c_i);
+            const std::size_t f0 = chunk * kChunk;
+            const std::size_t fCount = std::min(kChunk, F - f0);
+            float* dGate_t = dGate + t * F + f0;
+            float* dUp_t = dUp + t * F + f0;
+
+            if (attentionMask && attentionMask[t] == 0) {
+                std::fill(dGate_t, dGate_t + fCount, 0.0f);
+                std::fill(dUp_t, dUp_t + fCount, 0.0f);
+                continue;
+            }
+
+            silu_backward_exact_scalar(
+                dGate_t,
+                dUp_t,
+                dAct + t * F + f0,
+                gate + t * F + f0,
+                up + t * F + f0,
+                fCount);
+        }
+    }
+}
+
 static inline void apply_rope_forward_inplace(
     float* vec,
     std::size_t headDim,
@@ -505,8 +862,9 @@ static inline void apply_rope_forward_inplace(
     const std::size_t rd = std::min(headDim, ropeDim) & ~std::size_t(1);
     if (rd == 0) return;
 
-    for (std::size_t i = 0; i < rd; i += 2) {
-        const float invFreq = std::pow(ropeTheta, -static_cast<float>(i) / static_cast<float>(rd));
+    for (std::size_t pair = 0; pair < (rd / 2); ++pair) {
+        const std::size_t i = pair * 2;
+        const float invFreq = std::pow(ropeTheta, -static_cast<float>(i) / static_cast<float>(ropeDim));
         const float angle = static_cast<float>(pos) * invFreq;
         const float c = std::cos(angle);
         const float s = std::sin(angle);
@@ -529,8 +887,9 @@ static inline void apply_rope_backward_inplace(
     const std::size_t rd = std::min(headDim, ropeDim) & ~std::size_t(1);
     if (rd == 0) return;
 
-    for (std::size_t i = 0; i < rd; i += 2) {
-        const float invFreq = std::pow(ropeTheta, -static_cast<float>(i) / static_cast<float>(rd));
+    for (std::size_t pair = 0; pair < (rd / 2); ++pair) {
+        const std::size_t i = pair * 2;
+        const float invFreq = std::pow(ropeTheta, -static_cast<float>(i) / static_cast<float>(ropeDim));
         const float angle = static_cast<float>(pos) * invFreq;
         const float c = std::cos(angle);
         const float s = std::sin(angle);
@@ -590,7 +949,6 @@ CpuKernelBackend::CpuKernelBackend(TrainerConfig cfg)
     const std::size_t D = shape_.headDim();
     const std::size_t R = static_cast<std::size_t>(cfg_.loraRank);
     const std::size_t Tm = static_cast<std::size_t>(cfg_.maxSeqLen);
-
     const std::size_t kvDim = shape_.nKvHeads * D;
     const std::size_t nLoRALayers = shape_.nLayers;
     const std::size_t nHeads = shape_.nHeads;
@@ -705,16 +1063,20 @@ CpuKernelBackend::CpuKernelBackend(TrainerConfig cfg)
     const std::size_t maxAuxBwdDim = useBitNetFfn ? std::max(kvDim, F) : kvDim;
     const std::size_t auxJBlocks = (maxAuxBwdDim + cfg_.bitnetJQ - 1) / cfg_.bitnetJQ;
     const std::size_t tTileConst = static_cast<std::size_t>(cfg_.tTile);
+    const std::size_t fwdScratchRows =
+        std::max(tTileConst, exactFusedQkvForwardTileRows(cfg_.maxSeqLen, tTileConst));
+    const std::size_t bwdScratchRows = backwardScratchRows(cfg_.maxSeqLen, tTileConst);
 
-    fwdX8Scratch_.resize(tTileConst * maxFwdInputDim);
-    fwdXScaleScratch_.resize(tTileConst * maxKBlocks);
-    // bwd buffers must cover the widest output dimension (V) and its nJBlocks.
-    bwdDY8Scratch_.resize(tTileConst * V);
-    bwdDYScaleScratch_.resize(tTileConst * maxJBlocks);
-    bwdDK8Scratch_.resize(tTileConst * maxAuxBwdDim);
-    bwdDKScaleScratch_.resize(tTileConst * auxJBlocks);
-    bwdDV8Scratch_.resize(tTileConst * maxAuxBwdDim);
-    bwdDVScaleScratch_.resize(tTileConst * auxJBlocks);
+    fwdX8Scratch_.resize(fwdScratchRows * maxFwdInputDim);
+    fwdXScaleScratch_.resize(fwdScratchRows * maxKBlocks);
+    // Backward buffers must cover the widest output dimension and the largest
+    // runtime row chunk used by the exact BitNet backward paths.
+    bwdDY8Scratch_.resize(bwdScratchRows * V);
+    bwdDYScaleScratch_.resize(bwdScratchRows * maxJBlocks);
+    bwdDK8Scratch_.resize(bwdScratchRows * maxAuxBwdDim);
+    bwdDKScaleScratch_.resize(bwdScratchRows * auxJBlocks);
+    bwdDV8Scratch_.resize(bwdScratchRows * maxAuxBwdDim);
+    bwdDVScaleScratch_.resize(bwdScratchRows * auxJBlocks);
 
     std::mt19937 rng(42);
     std::normal_distribution<float> wdist(0.0f, 0.02f);
@@ -992,7 +1354,7 @@ void CpuKernelBackend::forward(
     const std::size_t F = shape_.ffnSize;
     const std::size_t D = shape_.headDim();
     const std::size_t ropeDim = shape_.ropeDim;
-    const float ropeTheta = shape_.ropeTheta;
+    const float       ropeTheta = shape_.ropeTheta;
     const std::size_t R = static_cast<std::size_t>(cfg_.loraRank);
     const std::size_t kvDim = shape_.kvDim(); // from ModelShape, not fragile Wk.size()/H
     const std::size_t nKvHeads = shape_.nKvHeads;
@@ -1001,6 +1363,19 @@ void CpuKernelBackend::forward(
     const std::size_t hTile = static_cast<std::size_t>(cfg_.hTile);
     const float       scale = cfg_.loraAlpha / float(R);
     const std::size_t CKPT_STRIDE = cfg_.maxSeqLen * H;
+    const std::size_t activePrefixT = contiguousActivePrefixLength(attentionMask);
+    const std::size_t activeComputeT =
+        (activePrefixComputeEnabled() && activePrefixT != static_cast<std::size_t>(-1))
+        ? activePrefixT
+        : T;
+    const int* const activeAttentionMask =
+        (activeComputeT < T) ? nullptr : attentionMask.data();
+    const std::size_t i2sActivePrefixT = exactMaskedTileSkipEnabled()
+        ? activePrefixT
+        : static_cast<std::size_t>(-1);
+    const int* const  i2sAttentionMask = (exactMaskedTileSkipEnabled() && i2sActivePrefixT == static_cast<std::size_t>(-1))
+        ? attentionMask.data()
+        : nullptr;
     const bool profile = backendProfileEnabled();
     const bool useFfnGemm = ffnGemmEnabled();
     const bool useBitNetFfn = cfg_.useBitNetQuant && ffnBitnetEnabled();
@@ -1031,14 +1406,47 @@ void CpuKernelBackend::forward(
         const std::size_t layerTFOffset = L * cfg_.maxSeqLen * F;
         const std::size_t layerTKVOffset = L * cfg_.maxSeqLen * kvDim;
         const std::size_t layerProbsOffset = L * nHeads * cfg_.maxSeqLen * cfg_.maxSeqLen;
+        float* const layerXnormCache = xnorm_cache_.data() + layerTHOffset;
+        float* const layerQCache = q_cache_.data() + layerTHOffset;
+        float* const layerKCache = k_cache_.data() + layerTKVOffset;
+        float* const layerVCache = v_cache_.data() + layerTKVOffset;
+        const bool fusedAttentionNormCacheWrite = fusedAttentionNormCacheWriteEnabled(activeComputeT);
+        const bool fusedAttentionQkvCacheWrite = fusedAttentionQkvCacheWriteEnabled(activeComputeT);
+        float* const attnXnormForwardWrite = fusedAttentionNormCacheWrite ? layerXnormCache : xnorm_.data();
+        const float* const attnXnormForward = attnXnormForwardWrite;
+        float* const qProj = fusedAttentionQkvCacheWrite ? layerQCache : q_.data();
+        float* const kProj = fusedAttentionQkvCacheWrite ? layerKCache : k_.data();
+        float* const vProj = fusedAttentionQkvCacheWrite ? layerVCache : v_.data();
 
-        for (std::size_t t = 0; t < T; ++t) {
-            float* xn = &xnorm_[t * H];
-            const float* x = &x_[t * H];
-            if (attentionMask[t] == 0) { std::fill(xn, xn + H, 0.0f); continue; }
-            rmsnorm(xn, x, layers_[L].rms_attn.data(), H, eps);
+        if (parallelRmsnormForwardEnabled() && T > 1) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+            for (ptrdiff_t t = 0; t < static_cast<ptrdiff_t>(T); ++t) {
+                const std::size_t tu = static_cast<std::size_t>(t);
+                float* xn = attnXnormForwardWrite + tu * H;
+                const float* x = &x_[tu * H];
+                if (attentionMask[tu] == 0) {
+                    std::fill(xn, xn + H, 0.0f);
+                    continue;
+                }
+                rmsnorm(xn, x, layers_[L].rms_attn.data(), H, eps);
+            }
         }
-        std::copy_n(xnorm_.data(), T * H, xnorm_cache_.data() + layerTHOffset);
+        else {
+            for (std::size_t t = 0; t < T; ++t) {
+                float* xn = attnXnormForwardWrite + t * H;
+                const float* x = &x_[t * H];
+                if (attentionMask[t] == 0) {
+                    std::fill(xn, xn + H, 0.0f);
+                    continue;
+                }
+                rmsnorm(xn, x, layers_[L].rms_attn.data(), H, eps);
+            }
+        }
+        if (!fusedAttentionNormCacheWrite) {
+            std::copy_n(xnorm_.data(), T * H, layerXnormCache);
+        }
 
         const bool enableTl2Q = tl2QEnabled(cfg_);
         const bool enableTl2K = tl2KEnabled(cfg_);
@@ -1087,240 +1495,453 @@ void CpuKernelBackend::forward(
             !useTl2GenWo;
         const bool useI2SWo = cfg_.useBitNetQuant && (H % 32 == 0) && cfg_.bitnetQuantizeWo && !useTl2GenWo && !useTl2Wo;
         const auto preAttnStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+        auto clearInactiveTail = [&](std::vector<float>& buffer, std::size_t rowWidth) {
+            if (activeComputeT < T) {
+                std::fill(
+                    buffer.begin() + static_cast<ptrdiff_t>(activeComputeT * rowWidth),
+                    buffer.begin() + static_cast<ptrdiff_t>(T * rowWidth),
+                    0.0f);
+            }
+        };
+        auto clearInactiveTailRaw = [&](float* buffer, std::size_t rowWidth) {
+            if (activeComputeT < T) {
+                std::fill(
+                    buffer + activeComputeT * rowWidth,
+                    buffer + T * rowWidth,
+                    0.0f);
+            }
+        };
+        auto prepareGeneratedOutput = [&](std::vector<float>& buffer, std::size_t rowWidth) {
+            if (tl2GeneratedCallerFillsEnabled()) {
+                std::fill(buffer.begin(), buffer.begin() + static_cast<ptrdiff_t>(T * rowWidth), 0.0f);
+            }
+            else {
+                clearInactiveTail(buffer, rowWidth);
+            }
+        };
+        auto prepareGeneratedOutputRaw = [&](float* buffer, std::size_t rowWidth) {
+            if (tl2GeneratedCallerFillsEnabled()) {
+                std::fill(buffer, buffer + T * rowWidth, 0.0f);
+            }
+            else {
+                clearInactiveTailRaw(buffer, rowWidth);
+            }
+        };
+        const bool useFusedTl2GenQV =
+            useTl2GenQ &&
+            !useTl2GenK &&
+            useTl2GenV &&
+            fusedTl2GeneratedQVEnabled() &&
+            !layers_[L].Wq_tl2g.i2sMain.empty() &&
+            !layers_[L].Wv_tl2g.i2sMain.empty();
+        const bool useFusedHybridQkv =
+            useTl2GenQ &&
+            !useTl2GenK &&
+            useTl2GenV &&
+            useI2SK &&
+            fusedTl2GeneratedHybridQkvEnabled() &&
+            !layers_[L].Wq_tl2g.i2sMain.empty() &&
+            !layers_[L].Wv_tl2g.i2sMain.empty();
+        const bool useFusedQkvOverwrite = fusedQkvForwardOverwriteEnabled(activeComputeT, tTile);
+        const std::size_t fusedQkvTileRows = exactFusedQkvForwardTileRows(activeComputeT, tTile);
 
         // ── QKV Projection ──
+        const auto qkvStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         if (useTl2GenQ && useTl2GenK && useTl2GenV) {
-            std::fill(q_.begin(), q_.begin() + (T * H), 0.0f);
-            std::fill(k_.begin(), k_.begin() + (T * kvDim), 0.0f);
-            std::fill(v_.begin(), v_.begin() + (T * kvDim), 0.0f);
-
-            linear_forward_bitnet_tl2_generated(q_.data(), xnorm_.data(), layers_[L].Wq_tl2g, T);
-            linear_forward_bitnet_tl2_generated(k_.data(), xnorm_.data(), layers_[L].Wk_tl2g, T);
-            linear_forward_bitnet_tl2_generated(v_.data(), xnorm_.data(), layers_[L].Wv_tl2g, T);
+            prepareGeneratedOutputRaw(qProj, H);
+            prepareGeneratedOutputRaw(kProj, kvDim);
+            prepareGeneratedOutputRaw(vProj, kvDim);
+            linear_forward_bitnet_tl2_generated(qProj, attnXnormForward, layers_[L].Wq_tl2g, activeComputeT);
+            linear_forward_bitnet_tl2_generated(kProj, attnXnormForward, layers_[L].Wk_tl2g, activeComputeT);
+            linear_forward_bitnet_tl2_generated(vProj, attnXnormForward, layers_[L].Wv_tl2g, activeComputeT);
         }
-        else if (useTl2Q && useTl2K && useTl2V) {
-            std::fill(q_.begin(), q_.begin() + (T * H), 0.0f);
-            std::fill(k_.begin(), k_.begin() + (T * kvDim), 0.0f);
-            std::fill(v_.begin(), v_.begin() + (T * kvDim), 0.0f);
-
-            linear_fused_qkv_forward_bitnet_tl2_accum(
-                q_.data(), k_.data(), v_.data(),
-                xnorm_.data(),
-                layers_[L].Wq_tl2, layers_[L].Wk_tl2, layers_[L].Wv_tl2,
-                T, tTile,
-                fwdX8Scratch_.data(), fwdXScaleScratch_.data());
-        }
-        else if (useFusedI2SQKV) {
-            std::fill(q_.begin(), q_.begin() + (T * H), 0.0f);
-            std::fill(k_.begin(), k_.begin() + (T * kvDim), 0.0f);
-            std::fill(v_.begin(), v_.begin() + (T * kvDim), 0.0f);
-
+        else if (useFusedHybridQkv) {
+            if (useFusedQkvOverwrite) {
+                clearInactiveTailRaw(qProj, H);
+                clearInactiveTailRaw(kProj, kvDim);
+                clearInactiveTailRaw(vProj, kvDim);
+            }
+            else {
+                prepareGeneratedOutputRaw(qProj, H);
+                std::fill_n(kProj, T * kvDim, 0.0f);
+                prepareGeneratedOutputRaw(vProj, kvDim);
+            }
             linear_fused_qkv_forward_bitnet_i2s_accum(
-                q_.data(), k_.data(), v_.data(),
-                xnorm_.data(),
-                layers_[L].Wq_q, layers_[L].Wk_q, layers_[L].Wv_q,
-                T, tTile,
+                qProj, kProj, vProj,
+                attnXnormForward,
+                layers_[L].Wq_tl2g.i2sMain, layers_[L].Wk_q, layers_[L].Wv_tl2g.i2sMain,
+                activeComputeT, tTile,
                 fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+            linear_forward_bitnet_tl2_generated_residual_only(qProj, attnXnormForward, layers_[L].Wq_tl2g, activeComputeT);
+            linear_forward_bitnet_tl2_generated_residual_only(vProj, attnXnormForward, layers_[L].Wv_tl2g, activeComputeT);
         }
-        else if (useI2SQ && useI2SK && useI2SV) {
-            std::fill(q_.begin(), q_.begin() + (T * H), 0.0f);
-            std::fill(k_.begin(), k_.begin() + (T * kvDim), 0.0f);
-            std::fill(v_.begin(), v_.begin() + (T * kvDim), 0.0f);
+        else if (useFusedTl2GenQV) {
+            prepareGeneratedOutputRaw(qProj, H);
+            prepareGeneratedOutputRaw(vProj, kvDim);
+            linear_fused_dual_forward_bitnet_tl2_generated(
+                qProj,
+                vProj,
+                attnXnormForward,
+                layers_[L].Wq_tl2g,
+                layers_[L].Wv_tl2g,
+                activeComputeT);
 
-            linear_forward_bitnet_i2s_accum(q_.data(), xnorm_.data(), layers_[L].Wq_q, T, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data());
-            linear_forward_bitnet_i2s_accum(k_.data(), xnorm_.data(), layers_[L].Wk_q, T, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data());
-            linear_forward_bitnet_i2s_accum(v_.data(), xnorm_.data(), layers_[L].Wv_q, T, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data());
-        }
-        else {
-            std::fill(q_.begin(), q_.begin() + (T * H), 0.0f);
-            std::fill(k_.begin(), k_.begin() + (T * kvDim), 0.0f);
-            std::fill(v_.begin(), v_.begin() + (T * kvDim), 0.0f);
-
-            if (useTl2GenQ) {
-                linear_forward_bitnet_tl2_generated(q_.data(), xnorm_.data(), layers_[L].Wq_tl2g, T);
-            }
-            else if (useTl2Q) {
+            std::fill_n(kProj, T * kvDim, 0.0f);
+            if (useTl2K) {
                 linear_forward_bitnet_tl2_accum(
-                    q_.data(), xnorm_.data(), layers_[L].Wq_tl2, T, tTile,
+                    kProj, attnXnormForward, layers_[L].Wk_tl2, activeComputeT, tTile,
                     fwdX8Scratch_.data(), fwdXScaleScratch_.data());
             }
-            else if (useI2SQ) {
+            else if (useI2SK) {
                 linear_forward_bitnet_i2s_accum(
-                    q_.data(), xnorm_.data(), layers_[L].Wq_q, T, tTile,
-                    fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                    kProj, attnXnormForward, layers_[L].Wk_q, activeComputeT, tTile,
+                    fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
             }
             else {
                 for (std::size_t t = 0; t < T; ++t) {
                     if (attentionMask[t] == 0) continue;
-                    const float* xn = &xnorm_[t * H];
-                    float* qt = &q_[t * H];
-                    for (std::size_t i = 0; i < H; ++i) {
-                        float sum_q = 0; for (std::size_t j = 0; j < H; ++j) sum_q += xn[j] * layers_[L].Wq[j * H + i]; qt[i] = sum_q;
+                    const float* xn = attnXnormForward + t * H;
+                    float* kt = kProj + t * kvDim;
+                    for (std::size_t i = 0; i < kvDim; ++i) {
+                        float sum_k = 0; for (std::size_t j = 0; j < H; ++j) sum_k += xn[j] * layers_[L].Wk[j * kvDim + i]; kt[i] = sum_k;
+                    }
+                }
+            }
+        }
+        else if (useTl2Q && useTl2K && useTl2V) {
+            std::fill_n(qProj, T * H, 0.0f);
+            std::fill_n(kProj, T * kvDim, 0.0f);
+            std::fill_n(vProj, T * kvDim, 0.0f);
+
+            linear_fused_qkv_forward_bitnet_tl2_accum(
+                qProj, kProj, vProj,
+                attnXnormForward,
+                layers_[L].Wq_tl2, layers_[L].Wk_tl2, layers_[L].Wv_tl2,
+                activeComputeT, tTile,
+                fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+        }
+        else if (useFusedI2SQKV) {
+            if (useFusedQkvOverwrite) {
+                clearInactiveTailRaw(qProj, H);
+                clearInactiveTailRaw(kProj, kvDim);
+                clearInactiveTailRaw(vProj, kvDim);
+            }
+            else {
+                std::fill_n(qProj, T * H, 0.0f);
+                std::fill_n(kProj, T * kvDim, 0.0f);
+                std::fill_n(vProj, T * kvDim, 0.0f);
+            }
+
+            linear_fused_qkv_forward_bitnet_i2s_accum(
+                qProj, kProj, vProj,
+                attnXnormForward,
+                layers_[L].Wq_q, layers_[L].Wk_q, layers_[L].Wv_q,
+                activeComputeT, fusedQkvTileRows,
+                fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+        }
+        else if (useI2SQ && useI2SK && useI2SV) {
+            std::fill_n(qProj, T * H, 0.0f);
+            std::fill_n(kProj, T * kvDim, 0.0f);
+            std::fill_n(vProj, T * kvDim, 0.0f);
+
+            linear_forward_bitnet_i2s_accum(qProj, attnXnormForward, layers_[L].Wq_q, activeComputeT, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
+            linear_forward_bitnet_i2s_accum(kProj, attnXnormForward, layers_[L].Wk_q, activeComputeT, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
+            linear_forward_bitnet_i2s_accum(vProj, attnXnormForward, layers_[L].Wv_q, activeComputeT, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
+        }
+        else {
+            if (useTl2GenQ && !useFusedTl2GenQV) {
+                prepareGeneratedOutputRaw(qProj, H);
+                linear_forward_bitnet_tl2_generated(qProj, attnXnormForward, layers_[L].Wq_tl2g, activeComputeT);
+            }
+            else {
+                std::fill_n(qProj, T * H, 0.0f);
+                if (useTl2Q) {
+                    linear_forward_bitnet_tl2_accum(
+                        qProj, attnXnormForward, layers_[L].Wq_tl2, activeComputeT, tTile,
+                        fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                }
+                else if (useI2SQ) {
+                    linear_forward_bitnet_i2s_accum(
+                        qProj, attnXnormForward, layers_[L].Wq_q, activeComputeT, tTile,
+                        fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
+                }
+                else {
+                    for (std::size_t t = 0; t < T; ++t) {
+                        if (attentionMask[t] == 0) continue;
+                        const float* xn = attnXnormForward + t * H;
+                        float* qt = qProj + t * H;
+                        for (std::size_t i = 0; i < H; ++i) {
+                            float sum_q = 0; for (std::size_t j = 0; j < H; ++j) sum_q += xn[j] * layers_[L].Wq[j * H + i]; qt[i] = sum_q;
+                        }
                     }
                 }
             }
 
             if (useFusedI2SKV) {
+                std::fill_n(kProj, T * kvDim, 0.0f);
+                std::fill_n(vProj, T * kvDim, 0.0f);
                 linear_fused_dual_forward_bitnet_i2s_accum(
-                    k_.data(), v_.data(),
-                    xnorm_.data(),
+                    kProj, vProj,
+                    attnXnormForward,
                     layers_[L].Wk_q, layers_[L].Wv_q,
-                    T, tTile,
-                    fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                    activeComputeT, tTile,
+                    fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
             }
             else {
                 if (useTl2GenK) {
-                    linear_forward_bitnet_tl2_generated(k_.data(), xnorm_.data(), layers_[L].Wk_tl2g, T);
-                }
-                else if (useTl2K) {
-                    linear_forward_bitnet_tl2_accum(
-                        k_.data(), xnorm_.data(), layers_[L].Wk_tl2, T, tTile,
-                        fwdX8Scratch_.data(), fwdXScaleScratch_.data());
-                }
-                else if (useI2SK) {
-                    linear_forward_bitnet_i2s_accum(
-                        k_.data(), xnorm_.data(), layers_[L].Wk_q, T, tTile,
-                        fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                    prepareGeneratedOutputRaw(kProj, kvDim);
+                    linear_forward_bitnet_tl2_generated(kProj, attnXnormForward, layers_[L].Wk_tl2g, activeComputeT);
                 }
                 else {
-                    for (std::size_t t = 0; t < T; ++t) {
-                        if (attentionMask[t] == 0) continue;
-                        const float* xn = &xnorm_[t * H];
-                        float* kt = &k_[t * kvDim];
-                        for (std::size_t i = 0; i < kvDim; ++i) {
-                            float sum_k = 0; for (std::size_t j = 0; j < H; ++j) sum_k += xn[j] * layers_[L].Wk[j * kvDim + i]; kt[i] = sum_k;
+                    std::fill_n(kProj, T * kvDim, 0.0f);
+                    if (useTl2K) {
+                        linear_forward_bitnet_tl2_accum(
+                            kProj, attnXnormForward, layers_[L].Wk_tl2, activeComputeT, tTile,
+                            fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                    }
+                    else if (useI2SK) {
+                        linear_forward_bitnet_i2s_accum(
+                            kProj, attnXnormForward, layers_[L].Wk_q, activeComputeT, tTile,
+                            fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
+                    }
+                    else {
+                        for (std::size_t t = 0; t < T; ++t) {
+                            if (attentionMask[t] == 0) continue;
+                            const float* xn = attnXnormForward + t * H;
+                            float* kt = kProj + t * kvDim;
+                            for (std::size_t i = 0; i < kvDim; ++i) {
+                                float sum_k = 0; for (std::size_t j = 0; j < H; ++j) sum_k += xn[j] * layers_[L].Wk[j * kvDim + i]; kt[i] = sum_k;
+                            }
                         }
                     }
                 }
 
-                if (useTl2GenV) {
-                    linear_forward_bitnet_tl2_generated(v_.data(), xnorm_.data(), layers_[L].Wv_tl2g, T);
-                }
-                else if (useTl2V) {
-                    linear_forward_bitnet_tl2_accum(
-                        v_.data(), xnorm_.data(), layers_[L].Wv_tl2, T, tTile,
-                        fwdX8Scratch_.data(), fwdXScaleScratch_.data());
-                }
-                else if (useI2SV) {
-                    linear_forward_bitnet_i2s_accum(
-                        v_.data(), xnorm_.data(), layers_[L].Wv_q, T, tTile,
-                        fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                if (useTl2GenV && !useFusedTl2GenQV) {
+                    prepareGeneratedOutputRaw(vProj, kvDim);
+                    linear_forward_bitnet_tl2_generated(vProj, attnXnormForward, layers_[L].Wv_tl2g, activeComputeT);
                 }
                 else {
-                    for (std::size_t t = 0; t < T; ++t) {
-                        if (attentionMask[t] == 0) continue;
-                        const float* xn = &xnorm_[t * H];
-                        float* vt = &v_[t * kvDim];
-                        for (std::size_t i = 0; i < kvDim; ++i) {
-                            float sum_v = 0; for (std::size_t j = 0; j < H; ++j) sum_v += xn[j] * layers_[L].Wv[j * kvDim + i]; vt[i] = sum_v;
+                    std::fill_n(vProj, T * kvDim, 0.0f);
+                    if (useTl2V) {
+                        linear_forward_bitnet_tl2_accum(
+                            vProj, attnXnormForward, layers_[L].Wv_tl2, activeComputeT, tTile,
+                            fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                    }
+                    else if (useI2SV) {
+                        linear_forward_bitnet_i2s_accum(
+                            vProj, attnXnormForward, layers_[L].Wv_q, activeComputeT, tTile,
+                            fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
+                    }
+                    else {
+                        for (std::size_t t = 0; t < T; ++t) {
+                            if (attentionMask[t] == 0) continue;
+                            const float* xn = attnXnormForward + t * H;
+                            float* vt = vProj + t * kvDim;
+                            for (std::size_t i = 0; i < kvDim; ++i) {
+                                float sum_v = 0; for (std::size_t j = 0; j < H; ++j) sum_v += xn[j] * layers_[L].Wv[j * kvDim + i]; vt[i] = sum_v;
+                            }
                         }
                     }
                 }
             }
         }
+        if (profile) prof.fwdQkvMs += elapsedMs(qkvStart);
 
         // ── LoRA Injection ──
-        for (std::size_t t = 0; t < T; ++t) {
+        const bool parallelAttentionPrep = parallelAttentionPrepEnabled(activeComputeT) && activeComputeT > 1;
+        const auto loraStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+        if (parallelAttentionPrep) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+            for (ptrdiff_t t = 0; t < static_cast<ptrdiff_t>(activeComputeT); ++t) {
+                const std::size_t tu = static_cast<std::size_t>(t);
+                float* tmpQ = &tmpQ_cache_[(L * cfg_.maxSeqLen + tu) * R];
+                float* tmpV = &tmpV_cache_[(L * cfg_.maxSeqLen + tu) * R];
+
+                if (activeAttentionMask && activeAttentionMask[tu] == 0) {
+                    std::fill(tmpQ, tmpQ + R, 0.0f);
+                    std::fill(tmpV, tmpV + R, 0.0f);
+                    continue;
+                }
+
+                lora_add_H(qProj + tu * H, attnXnormForward + tu * H, loras_[L].Aq.data(), loras_[L].Bq.data(), tmpQ, H, R, scale, hTile);
+
+                float* v_t = vProj + tu * kvDim;
+                const float* xn = attnXnormForward + tu * H;
+
+                for (std::size_t r = 0; r < R; ++r) {
+                    const float* aRow = &loras_[L].Av[r * H];
+                    tmpV[r] = dot_avx2_or_scalar(xn, aRow, H);
+                }
+                for (std::size_t r = 0; r < R; ++r) {
+                    const float* bRow = &loras_[L].Bv[r * kvDim];
+                    axpy_inplace_avx2_or_scalar(v_t, bRow, kvDim, scale * tmpV[r]);
+                }
+            }
+        }
+        else {
+            for (std::size_t t = 0; t < activeComputeT; ++t) {
+                float* tmpQ = &tmpQ_cache_[(L * cfg_.maxSeqLen + t) * R];
+                float* tmpV = &tmpV_cache_[(L * cfg_.maxSeqLen + t) * R];
+
+                if (activeAttentionMask && activeAttentionMask[t] == 0) {
+                    std::fill(tmpQ, tmpQ + R, 0.0f);
+                    std::fill(tmpV, tmpV + R, 0.0f);
+                    continue;
+                }
+
+                lora_add_H(qProj + t * H, attnXnormForward + t * H, loras_[L].Aq.data(), loras_[L].Bq.data(), tmpQ, H, R, scale, hTile);
+
+                float* v_t = vProj + t * kvDim;
+                const float* xn = attnXnormForward + t * H;
+
+                for (std::size_t r = 0; r < R; ++r) {
+                    const float* aRow = &loras_[L].Av[r * H];
+                    tmpV[r] = dot_avx2_or_scalar(xn, aRow, H);
+                }
+                for (std::size_t r = 0; r < R; ++r) {
+                    const float* bRow = &loras_[L].Bv[r * kvDim];
+                    axpy_inplace_avx2_or_scalar(v_t, bRow, kvDim, scale * tmpV[r]);
+                }
+            }
+        }
+        for (std::size_t t = activeComputeT; t < T; ++t) {
             float* tmpQ = &tmpQ_cache_[(L * cfg_.maxSeqLen + t) * R];
             float* tmpV = &tmpV_cache_[(L * cfg_.maxSeqLen + t) * R];
-
-            if (attentionMask[t] == 0) {
-                std::fill(tmpQ, tmpQ + R, 0.0f);
-                std::fill(tmpV, tmpV + R, 0.0f);
-                continue;
-            }
-
-            lora_add_H(&q_[t * H], &xnorm_[t * H], loras_[L].Aq.data(), loras_[L].Bq.data(), tmpQ, H, R, scale, hTile);
-
-            float* v_t = &v_[t * kvDim];
-            const float* xn = &xnorm_[t * H];
-
-            for (std::size_t r = 0; r < R; ++r) {
-                const float* aRow = &loras_[L].Av[r * H];
-                tmpV[r] = dot_avx2_or_scalar(xn, aRow, H);
-            }
-            for (std::size_t r = 0; r < R; ++r) {
-                const float* bRow = &loras_[L].Bv[r * kvDim];
-                axpy_inplace_avx2_or_scalar(v_t, bRow, kvDim, scale * tmpV[r]);
-            }
+            std::fill(tmpQ, tmpQ + R, 0.0f);
+            std::fill(tmpV, tmpV + R, 0.0f);
         }
+        if (profile) prof.fwdLoraMs += elapsedMs(loraStart);
 
         // ── RoPE on Q/K (pre-attention) ──
-        for (std::size_t t = 0; t < T; ++t) {
-            if (attentionMask[t] == 0) continue;
+        const auto ropeStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+        if (parallelAttentionPrep) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+            for (ptrdiff_t t = 0; t < static_cast<ptrdiff_t>(activeComputeT); ++t) {
+                const std::size_t tu = static_cast<std::size_t>(t);
+                if (activeAttentionMask && activeAttentionMask[tu] == 0) continue;
 
-            for (std::size_t h = 0; h < nHeads; ++h) {
-                apply_rope_forward_inplace(&q_[t * H + h * D], D, ropeDim, t, ropeTheta);
-            }
-            for (std::size_t kvh = 0; kvh < nKvHeads; ++kvh) {
-                apply_rope_forward_inplace(&k_[t * kvDim + kvh * D], D, ropeDim, t, ropeTheta);
+                for (std::size_t h = 0; h < nHeads; ++h) {
+                    apply_rope_forward_inplace(qProj + tu * H + h * D, D, ropeDim, tu, ropeTheta);
+                }
+                for (std::size_t kvh = 0; kvh < nKvHeads; ++kvh) {
+                    apply_rope_forward_inplace(kProj + tu * kvDim + kvh * D, D, ropeDim, tu, ropeTheta);
+                }
             }
         }
-        std::copy_n(q_.data(), T * H, q_cache_.data() + layerTHOffset);
-        std::copy_n(k_.data(), T * kvDim, k_cache_.data() + layerTKVOffset);
-        std::copy_n(v_.data(), T * kvDim, v_cache_.data() + layerTKVOffset);
+        else {
+            for (std::size_t t = 0; t < activeComputeT; ++t) {
+                if (activeAttentionMask && activeAttentionMask[t] == 0) continue;
+
+                for (std::size_t h = 0; h < nHeads; ++h) {
+                    apply_rope_forward_inplace(qProj + t * H + h * D, D, ropeDim, t, ropeTheta);
+                }
+                for (std::size_t kvh = 0; kvh < nKvHeads; ++kvh) {
+                    apply_rope_forward_inplace(kProj + t * kvDim + kvh * D, D, ropeDim, t, ropeTheta);
+                }
+            }
+        }
+        if (profile) prof.fwdRopeMs += elapsedMs(ropeStart);
+
+        const auto cacheStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+        if (!fusedAttentionQkvCacheWrite) {
+            std::copy_n(qProj, T * H, layerQCache);
+            std::copy_n(kProj, T * kvDim, layerKCache);
+            std::copy_n(vProj, T * kvDim, layerVCache);
+        }
+        if (profile) prof.fwdCacheMs += elapsedMs(cacheStart);
         if (profile) prof.fwdAttnNormMs += elapsedMs(preAttnStart);
 
         // ── Attention ──
         const auto attnCoreStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+        if (activeComputeT < T) {
+            std::fill(ctx_.begin() + (activeComputeT * H), ctx_.begin() + (T * H), 0.0f);
+        }
+        float* attnScores = attentionStoreScoresEnabled() ? scores_.data() : nullptr;
         attn_causal(
-            ctx_.data(), q_.data(), k_.data(), v_.data(),
-            T, H, shape_.nHeads, nKvHeads, scores_.data(), probs_.data(),
-            attentionMask.data()
+            ctx_.data(), qProj, kProj, vProj,
+            activeComputeT, H, shape_.nHeads, nKvHeads, attnScores, probs_.data(),
+            activeAttentionMask
         );
         std::copy_n(probs_.data(), nHeads * T * T, probs_cache_.data() + layerProbsOffset);
 
         // ── Output Projection (Wo) ──
         if (useTl2GenWo) {
-            std::fill(attn_.begin(), attn_.begin() + (T * H), 0.0f);
-            linear_forward_bitnet_tl2_generated(attn_.data(), ctx_.data(), layers_[L].Wo_tl2g, T);
+            prepareGeneratedOutput(attn_, H);
+            linear_forward_bitnet_tl2_generated(attn_.data(), ctx_.data(), layers_[L].Wo_tl2g, activeComputeT);
         }
         else if (useTl2Wo) {
             std::fill(attn_.begin(), attn_.begin() + (T * H), 0.0f);
             linear_forward_bitnet_tl2_accum(
-                attn_.data(), ctx_.data(), layers_[L].Wo_tl2, T, tTile,
+                attn_.data(), ctx_.data(), layers_[L].Wo_tl2, activeComputeT, tTile,
                 fwdX8Scratch_.data(), fwdXScaleScratch_.data());
         }
         else if (useI2SWo) {
             std::fill(attn_.begin(), attn_.begin() + (T * H), 0.0f);
             const std::size_t nXBlocks = layers_[L].Wo_q.nKBlocks();
             (void)nXBlocks;
-            linear_forward_bitnet_i2s_accum(attn_.data(), ctx_.data(), layers_[L].Wo_q, T, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+            linear_forward_bitnet_i2s_accum(attn_.data(), ctx_.data(), layers_[L].Wo_q, activeComputeT, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
         }
         else {
             std::fill(attn_.begin(), attn_.begin() + (T * H), 0.0f);
             for (std::size_t t = 0; t < T; ++t) {
                 if (attentionMask[t] == 0) continue;
-                const float* ct = &ctx_[t * H]; float* at = &attn_[t * H];
+                const float* ct = &ctx_[t * H];
+                float* at = &attn_[t * H];
                 for (std::size_t i = 0; i < H; ++i) {
-                    float sum = 0; for (std::size_t j = 0; j < H; ++j) sum += ct[j] * layers_[L].Wo[j * H + i]; at[i] = sum;
+                    float sum = 0; for (std::size_t j = 0; j < H; ++j) sum += ct[j] * layers_[L].Wo[j * H + i];
+                    at[i] = sum;
                 }
             }
         }
 
         // First residual: x_mid = x + attn
-        for (std::size_t t = 0; t < T; ++t) {
+        for (std::size_t t = 0; t < activeComputeT; ++t) {
             float* xMid = &x_mid_[t * H];
             const float* xIn = &x_[t * H];
             const float* at = &attn_[t * H];
-            if (attentionMask[t] == 0) {
+            if (activeAttentionMask && activeAttentionMask[t] == 0) {
                 std::fill(xMid, xMid + H, 0.0f);
                 continue;
             }
             for (std::size_t h = 0; h < H; ++h) xMid[h] = xIn[h] + at[h];
+        }
+        for (std::size_t t = activeComputeT; t < T; ++t) {
+            std::fill(&x_mid_[t * H], &x_mid_[t * H] + H, 0.0f);
         }
         std::copy_n(x_mid_.data(), T * H, x_mid_cache_.data() + layerTHOffset);
         if (profile) prof.fwdAttnMs += elapsedMs(attnCoreStart);
 
         // FFN pre-norm.
         const auto ffnStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
-        for (std::size_t t = 0; t < T; ++t) {
-            float* xn = &xnorm_ffn_[t * H];
-            if (attentionMask[t] == 0) {
-                std::fill(xn, xn + H, 0.0f);
-                continue;
+        if (parallelRmsnormForwardEnabled() && activeComputeT > 1) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+            for (ptrdiff_t t = 0; t < static_cast<ptrdiff_t>(activeComputeT); ++t) {
+                float* xn = &xnorm_ffn_[static_cast<std::size_t>(t) * H];
+                if (activeAttentionMask && activeAttentionMask[static_cast<std::size_t>(t)] == 0) {
+                    std::fill(xn, xn + H, 0.0f);
+                    continue;
+                }
+                rmsnorm(xn, &x_mid_[static_cast<std::size_t>(t) * H], layers_[L].rms_ffn.data(), H, eps);
             }
-            rmsnorm(xn, &x_mid_[t * H], layers_[L].rms_ffn.data(), H, eps);
+        }
+        else {
+            for (std::size_t t = 0; t < activeComputeT; ++t) {
+                float* xn = &xnorm_ffn_[t * H];
+                if (activeAttentionMask && activeAttentionMask[t] == 0) {
+                    std::fill(xn, xn + H, 0.0f);
+                    continue;
+                }
+                rmsnorm(xn, &x_mid_[t * H], layers_[L].rms_ffn.data(), H, eps);
+            }
+        }
+        for (std::size_t t = activeComputeT; t < T; ++t) {
+            std::fill(&xnorm_ffn_[t * H], &xnorm_ffn_[t * H] + H, 0.0f);
         }
 
         const bool enableTl2Gate = tl2GateEnabled(cfg_);
@@ -1357,80 +1978,119 @@ void CpuKernelBackend::forward(
         const bool useI2SUp = useBitNetFfn && !useTl2GenUp && !useTl2Up;
         const bool useI2SDown = useBitNetFfn && !useTl2GenDown && !useTl2Down;
         const bool useFusedI2SGateUp = useI2SGate && useI2SUp;
-
         if (useBitNetFfn) {
-            std::fill(gate_.begin(), gate_.begin() + (T * F), 0.0f);
-            std::fill(up_.begin(), up_.begin() + (T * F), 0.0f);
-            std::fill(ffn_out_.begin(), ffn_out_.begin() + (T * H), 0.0f);
+            if (useTl2GenGate) {
+                prepareGeneratedOutput(gate_, F);
+            }
+            else {
+                std::fill(gate_.begin(), gate_.end(), 0.0f);
+            }
+            if (useTl2GenUp) {
+                prepareGeneratedOutput(up_, F);
+            }
+            else {
+                std::fill(up_.begin(), up_.end(), 0.0f);
+            }
+            if (useTl2GenDown) {
+                prepareGeneratedOutput(ffn_out_, H);
+            }
+            else {
+                std::fill(ffn_out_.begin(), ffn_out_.end(), 0.0f);
+            }
 
             if (useFusedI2SGateUp) {
                 linear_fused_dual_forward_bitnet_i2s_accum(
                     gate_.data(), up_.data(),
                     xnorm_ffn_.data(),
                     layers_[L].Wgate_q, layers_[L].Wup_q,
-                    T, tTile,
-                    fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                    activeComputeT, tTile,
+                    fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
             }
             else {
                 if (useTl2GenGate) {
-                    linear_forward_bitnet_tl2_generated(gate_.data(), xnorm_ffn_.data(), layers_[L].Wgate_tl2g, T);
+                    linear_forward_bitnet_tl2_generated(gate_.data(), xnorm_ffn_.data(), layers_[L].Wgate_tl2g, activeComputeT);
                 }
                 else if (useTl2Gate) {
                     linear_forward_bitnet_tl2_accum(
-                        gate_.data(), xnorm_ffn_.data(), layers_[L].Wgate_tl2, T, tTile,
+                        gate_.data(), xnorm_ffn_.data(), layers_[L].Wgate_tl2, activeComputeT, tTile,
                         fwdX8Scratch_.data(), fwdXScaleScratch_.data());
                 }
                 else if (useI2SGate) {
                     linear_forward_bitnet_i2s_accum(
-                        gate_.data(), xnorm_ffn_.data(), layers_[L].Wgate_q, T, tTile,
-                        fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                        gate_.data(), xnorm_ffn_.data(), layers_[L].Wgate_q, activeComputeT, tTile,
+                        fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
                 }
 
                 if (useTl2GenUp) {
-                    linear_forward_bitnet_tl2_generated(up_.data(), xnorm_ffn_.data(), layers_[L].Wup_tl2g, T);
+                    linear_forward_bitnet_tl2_generated(up_.data(), xnorm_ffn_.data(), layers_[L].Wup_tl2g, activeComputeT);
                 }
                 else if (useTl2Up) {
                     linear_forward_bitnet_tl2_accum(
-                        up_.data(), xnorm_ffn_.data(), layers_[L].Wup_tl2, T, tTile,
+                        up_.data(), xnorm_ffn_.data(), layers_[L].Wup_tl2, activeComputeT, tTile,
                         fwdX8Scratch_.data(), fwdXScaleScratch_.data());
                 }
                 else if (useI2SUp) {
                     linear_forward_bitnet_i2s_accum(
-                        up_.data(), xnorm_ffn_.data(), layers_[L].Wup_q, T, tTile,
-                        fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                        up_.data(), xnorm_ffn_.data(), layers_[L].Wup_q, activeComputeT, tTile,
+                        fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
                 }
             }
+            if (((activePrefixT == T) || prefixMaskFastpathEnabled()) &&
+                activePrefixT != static_cast<std::size_t>(-1)) {
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
-            for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
-                const std::size_t t = static_cast<std::size_t>(t_i);
-                float* gate_t = &gate_[t * F];
-                float* up_t = &up_[t * F];
-                float* act_t = &ffn_act_[t * F];
-                if (attentionMask[t] == 0) {
-                    std::fill(gate_t, gate_t + F, 0.0f);
-                    std::fill(up_t, up_t + F, 0.0f);
-                    std::fill(act_t, act_t + F, 0.0f);
-                    continue;
+                for (int t_i = 0; t_i < static_cast<int>(activePrefixT); ++t_i) {
+                    const std::size_t t = static_cast<std::size_t>(t_i);
+                    float* gate_t = &gate_[t * F];
+                    float* up_t = &up_[t * F];
+                    float* act_t = &ffn_act_[t * F];
+                    if (fastSiluForwardEnabled()) {
+                        silu_mul_avx2_or_scalar(act_t, gate_t, up_t, F);
+                    }
+                    else {
+                        silu_mul_exact_scalar(act_t, gate_t, up_t, F);
+                    }
                 }
-                if (fastSiluForwardEnabled()) {
-                    silu_mul_avx2_or_scalar(act_t, gate_t, up_t, F);
+                if (activePrefixT < T) {
+                    const std::size_t tailOffset = activePrefixT * F;
+                    const std::size_t tailCount = (T - activePrefixT) * F;
+                    std::fill_n(ffn_act_.data() + tailOffset, tailCount, 0.0f);
                 }
-                else {
-                    silu_mul_exact_scalar(act_t, gate_t, up_t, F);
+            }
+            else {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
+                    const std::size_t t = static_cast<std::size_t>(t_i);
+                    float* gate_t = &gate_[t * F];
+                    float* up_t = &up_[t * F];
+                    float* act_t = &ffn_act_[t * F];
+                    if (attentionMask[t] == 0) {
+                        std::fill(gate_t, gate_t + F, 0.0f);
+                        std::fill(up_t, up_t + F, 0.0f);
+                        std::fill(act_t, act_t + F, 0.0f);
+                        continue;
+                    }
+                    if (fastSiluForwardEnabled()) {
+                        silu_mul_avx2_or_scalar(act_t, gate_t, up_t, F);
+                    }
+                    else {
+                        silu_mul_exact_scalar(act_t, gate_t, up_t, F);
+                    }
                 }
             }
             if (useTl2GenDown) {
-                linear_forward_bitnet_tl2_generated(ffn_out_.data(), ffn_act_.data(), layers_[L].Wdown_tl2g, T);
+                linear_forward_bitnet_tl2_generated(ffn_out_.data(), ffn_act_.data(), layers_[L].Wdown_tl2g, activeComputeT);
             }
             else if (useTl2Down) {
                 linear_forward_bitnet_tl2_accum(
-                    ffn_out_.data(), ffn_act_.data(), layers_[L].Wdown_tl2, T, tTile,
+                    ffn_out_.data(), ffn_act_.data(), layers_[L].Wdown_tl2, activeComputeT, tTile,
                     fwdX8Scratch_.data(), fwdXScaleScratch_.data());
             }
             else if (useI2SDown) {
-                linear_forward_bitnet_i2s_accum(ffn_out_.data(), ffn_act_.data(), layers_[L].Wdown_q, T, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+                linear_forward_bitnet_i2s_accum(ffn_out_.data(), ffn_act_.data(), layers_[L].Wdown_q, activeComputeT, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
             }
         }
         else if (useFfnGemm) {
@@ -1565,15 +2225,18 @@ void CpuKernelBackend::forward(
         std::copy_n(up_.data(), T * F, up_cache_.data() + layerTFOffset);
 
         // Second residual: x = x_mid + ffn_out
-        for (std::size_t t = 0; t < T; ++t) {
+        for (std::size_t t = 0; t < activeComputeT; ++t) {
             float* xOut = &x_[t * H];
             const float* xMid = &x_mid_[t * H];
             const float* ffn = &ffn_out_[t * H];
-            if (attentionMask[t] == 0) {
+            if (activeAttentionMask && activeAttentionMask[t] == 0) {
                 std::fill(xOut, xOut + H, 0.0f);
                 continue;
             }
             for (std::size_t h = 0; h < H; ++h) xOut[h] = xMid[h] + ffn[h];
+        }
+        for (std::size_t t = activeComputeT; t < T; ++t) {
+            std::fill(&x_[t * H], &x_[t * H] + H, 0.0f);
         }
 
         std::copy(x_.begin(), x_.begin() + (T * H), &x_ckpt_[(L + 1) * CKPT_STRIDE]);
@@ -1585,9 +2248,26 @@ void CpuKernelBackend::forward(
 
     {
         const auto start = profile ? ProfileClock::now() : ProfileClock::time_point{};
-        for (std::size_t t = 0; t < T; ++t) {
-            if (attentionMask[t] == 0) { std::fill(&xnorm_final_[t * H], &xnorm_final_[t * H] + H, 0.0f); continue; }
-            rmsnorm(&xnorm_final_[t * H], &x_[t * H], rms_final_.data(), H, eps);
+        if (parallelRmsnormForwardEnabled() && activeComputeT > 1) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+            for (ptrdiff_t t = 0; t < static_cast<ptrdiff_t>(activeComputeT); ++t) {
+                if (activeAttentionMask && activeAttentionMask[static_cast<std::size_t>(t)] == 0) {
+                    std::fill(&xnorm_final_[static_cast<std::size_t>(t) * H], &xnorm_final_[static_cast<std::size_t>(t) * H] + H, 0.0f);
+                    continue;
+                }
+                rmsnorm(&xnorm_final_[static_cast<std::size_t>(t) * H], &x_[static_cast<std::size_t>(t) * H], rms_final_.data(), H, eps);
+            }
+        }
+        else {
+            for (std::size_t t = 0; t < activeComputeT; ++t) {
+                if (activeAttentionMask && activeAttentionMask[t] == 0) { std::fill(&xnorm_final_[t * H], &xnorm_final_[t * H] + H, 0.0f); continue; }
+                rmsnorm(&xnorm_final_[t * H], &x_[t * H], rms_final_.data(), H, eps);
+            }
+        }
+        for (std::size_t t = activeComputeT; t < T; ++t) {
+            std::fill(&xnorm_final_[t * H], &xnorm_final_[t * H] + H, 0.0f);
         }
         if (profile) prof.fwdFinalNormMs += elapsedMs(start);
     }
@@ -1609,7 +2289,7 @@ void CpuKernelBackend::forward(
                 }
             }
         }
-        linear_forward_bitnet_i2s_accum(logitsOut.data(), xnorm_final_.data(), W_out_q, T, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data());
+        linear_forward_bitnet_i2s_accum(logitsOut.data(), xnorm_final_.data(), W_out_q, activeComputeT, tTile, fwdX8Scratch_.data(), fwdXScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
 
         // Restore masked supervised-excluded rows so downstream users of
         // xnorm_final_ (current or future) observe consistent activations.
@@ -1628,27 +2308,31 @@ void CpuKernelBackend::forward(
             if (hasLossMask && lossMask[t] == 0) continue;
             lmHeadRowsScratch_.push_back(t);
         }
-#if defined(_OPENMP)
+        for (std::size_t row_i = 0; row_i < lmHeadRowsScratch_.size(); ++row_i) {
+            std::fill_n(&logitsOut[lmHeadRowsScratch_[row_i] * V], V, 0.0f);
+        }
+        const std::size_t rowBlockCount = (lmHeadRowsScratch_.size() + 3) / 4;
+        const std::size_t vTileCount = (V + vTile - 1) / vTile;
+ #if defined(_OPENMP)
 #pragma warning(suppress : 6993)
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
 #endif
-        for (int rowBase_i = 0; rowBase_i < static_cast<int>(lmHeadRowsScratch_.size()); rowBase_i += 4) {
-            const std::size_t rowBase = static_cast<std::size_t>(rowBase_i);
-            const std::size_t rowCount = std::min<std::size_t>(4, lmHeadRowsScratch_.size() - rowBase);
-
-            std::size_t rows[4] = { 0, 0, 0, 0 };
-            const float* hidden[4] = { nullptr, nullptr, nullptr, nullptr };
-            float* logits[4] = { nullptr, nullptr, nullptr, nullptr };
-            for (std::size_t r = 0; r < rowCount; ++r) {
-                rows[r] = lmHeadRowsScratch_[rowBase + r];
-                hidden[r] = &xnorm_final_[rows[r] * H];
-                logits[r] = &logitsOut[rows[r] * V];
-                std::fill_n(logits[r], V, 0.0f);
-            }
-
-            for (std::size_t v0 = 0; v0 < V; v0 += vTile) {
+        for (int rowBlock_i = 0; rowBlock_i < static_cast<int>(rowBlockCount); ++rowBlock_i) {
+            for (int vTile_i = 0; vTile_i < static_cast<int>(vTileCount); ++vTile_i) {
+                const std::size_t rowBase = static_cast<std::size_t>(rowBlock_i) * 4;
+                const std::size_t rowCount = std::min<std::size_t>(4, lmHeadRowsScratch_.size() - rowBase);
+                const std::size_t v0 = static_cast<std::size_t>(vTile_i) * vTile;
                 const std::size_t v1 = std::min(V, v0 + vTile);
                 const std::size_t len = v1 - v0;
+
+                std::size_t rows[4] = { 0, 0, 0, 0 };
+                const float* hidden[4] = { nullptr, nullptr, nullptr, nullptr };
+                float* logits[4] = { nullptr, nullptr, nullptr, nullptr };
+                for (std::size_t r = 0; r < rowCount; ++r) {
+                    rows[r] = lmHeadRowsScratch_[rowBase + r];
+                    hidden[r] = &xnorm_final_[rows[r] * H];
+                    logits[r] = &logitsOut[rows[r] * V];
+                }
 
                 if (rowCount == 4) {
                     float* out0 = logits[0] + v0;
@@ -1714,7 +2398,7 @@ void CpuKernelBackend::backward(
     const std::size_t F = shape_.ffnSize;
     const std::size_t D = shape_.headDim();
     const std::size_t ropeDim = shape_.ropeDim;
-    const float ropeTheta = shape_.ropeTheta;
+    const float       ropeTheta = shape_.ropeTheta;
     const std::size_t R = static_cast<std::size_t>(cfg_.loraRank);
     const std::size_t kvDim = shape_.kvDim(); // from ModelShape, not fragile Wk.size()/H
     const std::size_t nKvHeads = shape_.nKvHeads;
@@ -1724,9 +2408,29 @@ void CpuKernelBackend::backward(
     const std::size_t nLayers = shape_.nLayers;
     const float       eps = 1e-5f;
     const std::size_t CKPT_STRIDE = cfg_.maxSeqLen * H;
+    const std::size_t activePrefixT = contiguousActivePrefixLength(attentionMask);
+    const std::size_t activeComputeT =
+        (activePrefixComputeEnabled() && activePrefixT != static_cast<std::size_t>(-1))
+        ? activePrefixT
+        : T;
+    const int* const activeAttentionMask =
+        (activeComputeT < T) ? nullptr : attentionMask.data();
+    const std::size_t i2sActivePrefixT = exactMaskedTileSkipEnabled()
+        ? activePrefixT
+        : static_cast<std::size_t>(-1);
+    const int* const  i2sAttentionMask = (exactMaskedTileSkipEnabled() && i2sActivePrefixT == static_cast<std::size_t>(-1))
+        ? attentionMask.data()
+        : nullptr;
     const bool profile = backendProfileEnabled();
     const bool useFfnGemm = ffnGemmEnabled();
     const bool useBitNetFfn = cfg_.useBitNetQuant && ffnBitnetEnabled();
+    const bool usePrefixMaskFastpath =
+        activePrefixT != static_cast<std::size_t>(-1) &&
+        (prefixMaskFastpathEnabled() || activeComputeT == activePrefixT);
+    const bool bitnetFfnOverwritesSplitGradBuffers =
+        useBitNetFfn &&
+        usePrefixMaskFastpath &&
+        activeComputeT == activePrefixT;
     auto& prof = backendProfileState();
 
     // ── Backprop through LM head ──────────────────────────────────────────────
@@ -1742,7 +2446,17 @@ void CpuKernelBackend::backward(
         !cfg_.bitnetLmHeadFloatBackward &&
         (cfg_.bitnetQuantizeLmHead || cfg_.bitnetLmHeadQuantBackwardOnly);
     if (useQuantLmBackward) {
-        linear_backward_bitnet_i2s_packed(dXnorm_final_.data(), dLogits.data(), W_out_q, T, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data());
+        const std::size_t lmHeadBwdTileRows = exactLmHeadBackwardTileRows(activeComputeT, tTile);
+        linear_backward_bitnet_i2s_packed(
+            dXnorm_final_.data(),
+            dLogits.data(),
+            W_out_q,
+            activeComputeT,
+            lmHeadBwdTileRows,
+            bwdDY8Scratch_.data(),
+            bwdDYScaleScratch_.data(),
+            i2sAttentionMask,
+            i2sActivePrefixT);
     }
     else {
         lmHeadRowsScratch_.clear();
@@ -1751,53 +2465,75 @@ void CpuKernelBackend::backward(
             if (hasLossMask && lossMask[t] == 0) continue;
             lmHeadRowsScratch_.push_back(t);
         }
+        const std::size_t hChunk = envSizeTOr("QLORA_TEST_LMHEAD_BWD_HCHUNK", 64);
+        const bool useDenseLmBackward =
+            activeComputeT >= 128 &&
+            lmHeadRowsScratch_.size() * 2 >= activeComputeT;
+        if (useDenseLmBackward) {
+            linear_THF_from_FH_blocked4(
+                dXnorm_final_.data(),
+                dLogits.data(),
+                W_out_.data(),
+                activeComputeT,
+                V,
+                H,
+                hChunk,
+                tTile);
+        }
+        else {
+            const std::size_t hChunkCount = (H + hChunk - 1) / hChunk;
  #if defined(_OPENMP)
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for collapse(2) schedule(static)
 #endif
-        for (int row_i = 0; row_i < static_cast<int>(lmHeadRowsScratch_.size()); ++row_i) {
-            const std::size_t t = lmHeadRowsScratch_[static_cast<std::size_t>(row_i)];
-            const float* dlog_t = &dLogits[t * V];
-            float* dx_t = &dXnorm_final_[t * H];
+            for (int row_i = 0; row_i < static_cast<int>(lmHeadRowsScratch_.size()); ++row_i) {
+                for (int hChunk_i = 0; hChunk_i < static_cast<int>(hChunkCount); ++hChunk_i) {
+                    const std::size_t t = lmHeadRowsScratch_[static_cast<std::size_t>(row_i)];
+                    const float* dlog_t = &dLogits[t * V];
+                    float* dx_t = &dXnorm_final_[t * H];
+                    const std::size_t hStart = static_cast<std::size_t>(hChunk_i) * hChunk;
+                    const std::size_t hEnd = std::min(H, hStart + hChunk);
 
-            std::size_t h = 0;
-            for (; h + 3 < H; h += 4) {
-                float dx0 = 0.0f;
-                float dx1 = 0.0f;
-                float dx2 = 0.0f;
-                float dx3 = 0.0f;
-                dot_x4_avx2_or_scalar(
-                    &W_out_[(h + 0) * V],
-                    &W_out_[(h + 1) * V],
-                    &W_out_[(h + 2) * V],
-                    &W_out_[(h + 3) * V],
-                    dlog_t,
-                    V,
-                    dx0,
-                    dx1,
-                    dx2,
-                    dx3);
-                dx_t[h + 0] = dx0;
-                dx_t[h + 1] = dx1;
-                dx_t[h + 2] = dx2;
-                dx_t[h + 3] = dx3;
-            }
-            if (h + 1 < H) {
-                float dx0 = 0.0f;
-                float dx1 = 0.0f;
-                dot2_avx2_or_scalar(
-                    &W_out_[h * V],
-                    dlog_t,
-                    &W_out_[(h + 1) * V],
-                    dlog_t,
-                    V,
-                    dx0,
-                    dx1);
-                dx_t[h + 0] = dx0;
-                dx_t[h + 1] = dx1;
-                h += 2;
-            }
-            for (; h < H; ++h) {
-                dx_t[h] = dot_avx2_or_scalar(dlog_t, &W_out_[h * V], V);
+                    std::size_t h = hStart;
+                    for (; h + 3 < hEnd; h += 4) {
+                        float dx0 = 0.0f;
+                        float dx1 = 0.0f;
+                        float dx2 = 0.0f;
+                        float dx3 = 0.0f;
+                        dot_x4_avx2_or_scalar(
+                            &W_out_[(h + 0) * V],
+                            &W_out_[(h + 1) * V],
+                            &W_out_[(h + 2) * V],
+                            &W_out_[(h + 3) * V],
+                            dlog_t,
+                            V,
+                            dx0,
+                            dx1,
+                            dx2,
+                            dx3);
+                        dx_t[h + 0] = dx0;
+                        dx_t[h + 1] = dx1;
+                        dx_t[h + 2] = dx2;
+                        dx_t[h + 3] = dx3;
+                    }
+                    if (h + 1 < hEnd) {
+                        float dx0 = 0.0f;
+                        float dx1 = 0.0f;
+                        dot2_avx2_or_scalar(
+                            &W_out_[h * V],
+                            dlog_t,
+                            &W_out_[(h + 1) * V],
+                            dlog_t,
+                            V,
+                            dx0,
+                            dx1);
+                        dx_t[h + 0] = dx0;
+                        dx_t[h + 1] = dx1;
+                        h += 2;
+                    }
+                    for (; h < hEnd; ++h) {
+                        dx_t[h] = dot_avx2_or_scalar(dlog_t, &W_out_[h * V], V);
+                    }
+                }
             }
         }
     }
@@ -1805,9 +2541,9 @@ void CpuKernelBackend::backward(
 
     // ── Backprop through final RMSNorm ────────────────────────────────────────
     const auto finalNormStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
-    std::fill_n(dX_.data(), T * H, 0.0f);
-    for (std::size_t t = 0; t < T; ++t) {
-        if (attentionMask[t] == 0) continue;
+    std::fill_n(dX_.data(), activeComputeT * H, 0.0f);
+    for (std::size_t t = 0; t < activeComputeT; ++t) {
+        if (activeAttentionMask && activeAttentionMask[t] == 0) continue;
         rmsnorm_backward(&dX_[t * H], &dXnorm_final_[t * H], &x_[t * H], rms_final_.data(), H, eps);
     }
     if (profile) prof.bwdFinalNormMs += elapsedMs(finalNormStart);
@@ -1815,38 +2551,59 @@ void CpuKernelBackend::backward(
     // ── Layer loop (reverse) ─────────────────────────────────────────────────
     for (std::size_t Lrev = 0; Lrev < nLayers; ++Lrev) {
         const std::size_t L = nLayers - 1 - Lrev;
+        const std::size_t activeThSize = activeComputeT * H;
+        const std::size_t activeTkvSize = activeComputeT * kvDim;
+        const std::size_t activeTfSize = activeComputeT * F;
         const std::size_t thSize = T * H;
         const std::size_t tkvSize = T * kvDim;
         const std::size_t tfSize = T * F;
+        const bool useI2SWo = cfg_.useBitNetQuant && (H % 32 == 0) && cfg_.bitnetQuantizeWo;
+        const bool useWoBackwardOverwrite =
+            useI2SWo &&
+            woBackwardOverwriteEnabled(activeComputeT);
+        const bool skipGroupedAttentionKvPreclear =
+            groupedAttentionBackwardKvPreclearEnabled(activeComputeT, nHeads, nKvHeads);
 
         // Clear all per-layer temporaries.
         const auto layerClearStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
-        std::fill_n(dAttn_.data(), thSize, 0.0f);
-        std::fill_n(dCtx_.data(), thSize, 0.0f);
-        std::fill_n(dQ_.data(), thSize, 0.0f);
-        std::fill_n(dK_.data(), tkvSize, 0.0f);
-        std::fill_n(dV_.data(), tkvSize, 0.0f);
-        std::fill_n(dXnorm_.data(), thSize, 0.0f);
-        std::fill_n(dXin_.data(), thSize, 0.0f);
-        std::fill_n(dXmid_.data(), thSize, 0.0f);
-        std::fill_n(dFfnOut_.data(), thSize, 0.0f);
-        std::fill_n(dAct_.data(), tfSize, 0.0f);
-        std::fill_n(dGate_.data(), tfSize, 0.0f);
-        std::fill_n(dUp_.data(), tfSize, 0.0f);
-        std::fill_n(dXnormFfn_.data(), thSize, 0.0f);
+        std::fill_n(dCtx_.data(), activeThSize, 0.0f);
+        std::fill_n(dAttn_.data(), activeThSize, 0.0f);
+        std::fill_n(dQ_.data(), activeThSize, 0.0f);
+        if (!skipGroupedAttentionKvPreclear) {
+            std::fill_n(dK_.data(), activeTkvSize, 0.0f);
+            std::fill_n(dV_.data(), activeTkvSize, 0.0f);
+        }
+        std::fill_n(dXnorm_.data(), activeThSize, 0.0f);
+        std::fill_n(dXin_.data(), activeThSize, 0.0f);
+        std::fill_n(dAct_.data(), activeTfSize, 0.0f);
+        std::fill_n(dGate_.data(), activeTfSize, 0.0f);
+        std::fill_n(dUp_.data(), activeTfSize, 0.0f);
+        std::fill_n(dXnormFfn_.data(), activeThSize, 0.0f);
         std::fill_n(tmpdP_.data(), T, 0.0f);
         if (profile) prof.bwdClearMs += elapsedMs(layerClearStart);
 
         // Restore the pre-layer activation from the checkpoint.
         const auto layerRestoreStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
-        std::copy(&x_ckpt_[L * CKPT_STRIDE], &x_ckpt_[L * CKPT_STRIDE] + (T * H), x_.begin());
+        std::copy(&x_ckpt_[L * CKPT_STRIDE], &x_ckpt_[L * CKPT_STRIDE] + thSize, x_.begin());
 
         const bool useI2SQ = cfg_.useBitNetQuant && (H % 32 == 0) && cfg_.bitnetQuantizeQKV;
         const bool useI2SK = cfg_.useBitNetQuant && (H % 32 == 0) && cfg_.bitnetQuantizeQKV;
         const bool useI2SV = cfg_.useBitNetQuant && (H % 32 == 0) && cfg_.bitnetQuantizeQKV;
         const bool useFusedI2SQKV = useI2SQ && useI2SK && useI2SV && cfg_.bitnetFuseQKV;
         const bool useFusedI2SKV = useI2SK && useI2SV && !useFusedI2SQKV;
-        const bool useI2SWo = cfg_.useBitNetQuant && (H % 32 == 0) && cfg_.bitnetQuantizeWo;
+        const bool useDirectAttentionBackwardCache =
+            directAttentionBackwardCacheEnabled(activeComputeT);
+        const bool useDirectFfnBackwardCache =
+            directFfnBackwardCacheEnabled(activeComputeT);
+        const bool useBitNetFfnStreamedPrefixBwd =
+            bitnetFfnOverwritesSplitGradBuffers &&
+            bitnetFfnStreamedPrefixBackwardEnabled();
+        const bool useChunkedFfnBwd =
+            useBitNetFfn &&
+            !useBitNetFfnStreamedPrefixBwd &&
+            exactChunkedFfnBackwardEnabled(activeComputeT);
+        const std::size_t ffnBwdChunkRows =
+            exactChunkedFfnBackwardRows(activeComputeT, tTile);
         (void)useI2SWo;
 
         const std::size_t layerTHOffset = L * cfg_.maxSeqLen * H;
@@ -1854,77 +2611,501 @@ void CpuKernelBackend::backward(
         const std::size_t layerTKVOffset = L * cfg_.maxSeqLen * kvDim;
         const std::size_t layerProbsOffset = L * nHeads * cfg_.maxSeqLen * cfg_.maxSeqLen;
 
-        std::copy_n(xnorm_cache_.data() + layerTHOffset, T * H, xnorm_.data());
-        std::copy_n(q_cache_.data() + layerTHOffset, T * H, q_.data());
-        std::copy_n(k_cache_.data() + layerTKVOffset, T * kvDim, k_.data());
-        std::copy_n(v_cache_.data() + layerTKVOffset, T * kvDim, v_.data());
-        std::copy_n(probs_cache_.data() + layerProbsOffset, nHeads * T * T, probs_.data());
-        std::copy_n(x_mid_cache_.data() + layerTHOffset, T * H, x_mid_.data());
-        std::copy_n(gate_cache_.data() + layerTFOffset, T * F, gate_.data());
-        std::copy_n(up_cache_.data() + layerTFOffset, T * F, up_.data());
+        const float* const layerXnormCache = xnorm_cache_.data() + layerTHOffset;
+        const float* const layerQCache = q_cache_.data() + layerTHOffset;
+        const float* const layerKCache = k_cache_.data() + layerTKVOffset;
+        const float* const layerVCache = v_cache_.data() + layerTKVOffset;
+        const float* const layerProbsCache = probs_cache_.data() + layerProbsOffset;
+        const float* const layerXmidCache = x_mid_cache_.data() + layerTHOffset;
+        const float* const layerGateCache = gate_cache_.data() + layerTFOffset;
+        const float* const layerUpCache = up_cache_.data() + layerTFOffset;
+        const float* const attnXnorm = useDirectAttentionBackwardCache ? layerXnormCache : xnorm_.data();
+        const float* const attnQ = useDirectAttentionBackwardCache ? layerQCache : q_.data();
+        const float* const attnK = useDirectAttentionBackwardCache ? layerKCache : k_.data();
+        const float* const attnV = useDirectAttentionBackwardCache ? layerVCache : v_.data();
+        const float* const attnProbs = useDirectAttentionBackwardCache ? layerProbsCache : probs_.data();
+        const float* const ffnXmid = useDirectFfnBackwardCache ? layerXmidCache : x_mid_.data();
+        const float* const ffnGate = useDirectFfnBackwardCache ? layerGateCache : gate_.data();
+        const float* const ffnUp = useDirectFfnBackwardCache ? layerUpCache : up_.data();
+
+        if (!useDirectAttentionBackwardCache) {
+            std::copy_n(layerXnormCache, thSize, xnorm_.data());
+            std::copy_n(layerQCache, thSize, q_.data());
+            std::copy_n(layerKCache, tkvSize, k_.data());
+            std::copy_n(layerVCache, tkvSize, v_.data());
+            std::copy_n(layerProbsCache, nHeads * T * T, probs_.data());
+        }
+        if (!useDirectFfnBackwardCache) {
+            std::copy_n(layerXmidCache, thSize, x_mid_.data());
+        }
+        if (!useBitNetFfnStreamedPrefixBwd && !useDirectFfnBackwardCache) {
+            std::copy_n(layerGateCache, tfSize, gate_.data());
+            std::copy_n(layerUpCache, tfSize, up_.data());
+        }
         if (profile) prof.bwdRestoreMs += elapsedMs(layerRestoreStart);
 
         // Backprop through FFN second residual:
         // x_out = x_mid + down(silu(gate(xnorm_ffn)) * up(xnorm_ffn)).
         const auto ffnStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
-        for (std::size_t i = 0; i < T * H; ++i) {
-            dXmid_[i] = dX_[i];
+        const bool useRmsnormBwdAccum = rmsnormBackwardAccumEnabled();
+        const bool fuseFfnResidualAdd =
+            useBitNetFfn &&
+            !useRmsnormBwdAccum &&
+            ffnBackwardFuseResidualAddEnabled(activeComputeT);
+        if (!fuseFfnResidualAdd) {
+            for (std::size_t i = 0; i < activeThSize; ++i) {
+                dXmid_[i] = dX_[i];
+            }
         }
 
         if (useBitNetFfn) {
-            linear_backward_bitnet_i2s_packed(dAct_.data(), dX_.data(), layers_[L].Wdown_q, T, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data());
+            if (useBitNetFfnStreamedPrefixBwd) {
+                const std::size_t requestedChunkT =
+                    bitnetFfnStreamedPrefixBackwardChunkT(32);
+                const std::size_t chunkT =
+                    std::max<std::size_t>(tTile, requestedChunkT);
+                const float* gateCacheLayer = layerGateCache;
+                const float* upCacheLayer = layerUpCache;
 
+                for (std::size_t tBase = 0; tBase < activeComputeT; tBase += chunkT) {
+                    const std::size_t rows = std::min(chunkT, activeComputeT - tBase);
+                    float* dActChunk = dAct_.data() + tBase * F;
+                    float* dGateChunk = dGate_.data() + tBase * F;
+                    float* dUpChunk = dUp_.data() + tBase * F;
+                    float* dXChunk = dX_.data() + tBase * H;
+                    float* dXnormFfnChunk = dXnormFfn_.data() + tBase * H;
+                    float* dXinChunk = dXin_.data() + tBase * H;
+                    float* dXmidChunk = dXmid_.data() + tBase * H;
+                    const float* gateChunk = gateCacheLayer + tBase * F;
+                    const float* upChunk = upCacheLayer + tBase * F;
+                    const float* xMidChunk = ffnXmid + tBase * H;
+
+                    const auto wdownStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                    linear_backward_bitnet_i2s_packed(
+                        dActChunk,
+                        dXChunk,
+                        layers_[L].Wdown_q,
+                        rows,
+                        tTile,
+                        bwdDY8Scratch_.data(),
+                        bwdDYScaleScratch_.data(),
+                        nullptr,
+                        rows,
+                        true);
+                    if (profile) prof.bwdFfnWdownMs += elapsedMs(wdownStart);
+
+                    const auto siluStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                    if (fastSiluBackwardEnabled()) {
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
-            for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
-                const std::size_t t = static_cast<std::size_t>(t_i);
-                float* dAct_t = &dAct_[t * F];
-                float* dGate_t = &dGate_[t * F];
-                float* dUp_t = &dUp_[t * F];
-                const float* gate_t = &gate_[t * F];
-                const float* up_t = &up_[t * F];
+                        for (int t_i = 0; t_i < static_cast<int>(rows); ++t_i) {
+                            const std::size_t t = static_cast<std::size_t>(t_i);
+                            silu_backward_avx2_or_scalar(
+                                dGateChunk + t * F,
+                                dUpChunk + t * F,
+                                dActChunk + t * F,
+                                gateChunk + t * F,
+                                upChunk + t * F,
+                                F);
+                        }
+                    }
+                    else if (exactSiluBackwardChunkedEnabled()) {
+                        silu_backward_exact_chunked(
+                            dGateChunk,
+                            dUpChunk,
+                            dActChunk,
+                            gateChunk,
+                            upChunk,
+                            rows,
+                            F,
+                            nullptr);
+                    }
+                    else {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                        for (int t_i = 0; t_i < static_cast<int>(rows); ++t_i) {
+                            const std::size_t t = static_cast<std::size_t>(t_i);
+                            silu_backward_exact_scalar(
+                                dGateChunk + t * F,
+                                dUpChunk + t * F,
+                                dActChunk + t * F,
+                                gateChunk + t * F,
+                                upChunk + t * F,
+                                F);
+                        }
+                    }
+                    if (profile) prof.bwdFfnSiluMs += elapsedMs(siluStart);
 
-                if (attentionMask[t] == 0) {
-                    std::fill(dAct_t, dAct_t + F, 0.0f);
-                    std::fill(dGate_t, dGate_t + F, 0.0f);
-                    std::fill(dUp_t, dUp_t + F, 0.0f);
-                    continue;
-                }
-                if (fastSiluBackwardEnabled()) {
-                    silu_backward_avx2_or_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
-                }
-                else {
-                    silu_backward_exact_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+                    const auto dualStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                    linear_fused_dual_backward_bitnet_i2s_packed(
+                        dXnormFfnChunk,
+                        dUpChunk,
+                        dGateChunk,
+                        layers_[L].Wup_q,
+                        layers_[L].Wgate_q,
+                        rows,
+                        tTile,
+                        bwdDY8Scratch_.data(),
+                        bwdDYScaleScratch_.data(),
+                        bwdDK8Scratch_.data(),
+                        bwdDKScaleScratch_.data(),
+                        nullptr,
+                        rows,
+                        false);
+                    if (profile) prof.bwdFfnDualMs += elapsedMs(dualStart);
+
+                    const auto normStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                    for (int t_i = 0; t_i < static_cast<int>(rows); ++t_i) {
+                        const std::size_t t = static_cast<std::size_t>(t_i);
+                        if (useRmsnormBwdAccum) {
+                            rmsnorm_backward_accum(
+                                dXmidChunk + t * H,
+                                dXnormFfnChunk + t * H,
+                                xMidChunk + t * H,
+                                layers_[L].rms_ffn.data(),
+                                H,
+                                eps);
+                        }
+                        else {
+                            rmsnorm_backward(
+                                dXinChunk + t * H,
+                                dXnormFfnChunk + t * H,
+                                xMidChunk + t * H,
+                                layers_[L].rms_ffn.data(),
+                                H,
+                                eps);
+
+                            float* dXmid_t = dXmidChunk + t * H;
+                            const float* dResidual_t = dXChunk + t * H;
+                            const float* dXmidFromNorm_t = dXinChunk + t * H;
+                            for (std::size_t h = 0; h < H; ++h) {
+                                dXmid_t[h] = fuseFfnResidualAdd
+                                    ? (dResidual_t[h] + dXmidFromNorm_t[h])
+                                    : (dXmid_t[h] + dXmidFromNorm_t[h]);
+                            }
+                        }
+                    }
+                    if (profile) prof.bwdFfnNormMs += elapsedMs(normStart);
                 }
             }
+            else {
+                if (useChunkedFfnBwd && ffnBwdChunkRows < activeComputeT) {
+                    const std::size_t wdownBwdTileRows = exactWdownBackwardTileRows(activeComputeT, tTile);
+                    for (std::size_t tBase = 0; tBase < activeComputeT; tBase += ffnBwdChunkRows) {
+                        const std::size_t rows = std::min(ffnBwdChunkRows, activeComputeT - tBase);
+                        float* dActChunk = dAct_.data() + tBase * F;
+                        float* dGateChunk = dGate_.data() + tBase * F;
+                        float* dUpChunk = dUp_.data() + tBase * F;
+                        float* dXChunk = dX_.data() + tBase * H;
+                        float* dXnormFfnChunk = dXnormFfn_.data() + tBase * H;
+                        float* dXinChunk = dXin_.data() + tBase * H;
+                        float* dXmidChunk = dXmid_.data() + tBase * H;
+                        const float* gateChunk = ffnGate + tBase * F;
+                        const float* upChunk = ffnUp + tBase * F;
+                        const float* xMidChunk = ffnXmid + tBase * H;
+                        const int* const chunkActiveMask =
+                            activeAttentionMask ? (activeAttentionMask + tBase) : nullptr;
+                        const int* const chunkI2sMask =
+                            i2sAttentionMask ? (i2sAttentionMask + tBase) : nullptr;
+                        const std::size_t chunkI2sActivePrefixT =
+                            (i2sActivePrefixT == static_cast<std::size_t>(-1))
+                            ? static_cast<std::size_t>(-1)
+                            : ((i2sActivePrefixT > tBase)
+                                ? std::min(rows, i2sActivePrefixT - tBase)
+                                : static_cast<std::size_t>(0));
 
-            std::fill(dXnormFfn_.begin(), dXnormFfn_.begin() + (T * H), 0.0f);
-            linear_fused_dual_backward_bitnet_i2s_packed(
-                dXnormFfn_.data(),
-                dUp_.data(), dGate_.data(),
-                layers_[L].Wup_q, layers_[L].Wgate_q,
-                T, tTile,
-                bwdDY8Scratch_.data(), bwdDYScaleScratch_.data(),
-                bwdDK8Scratch_.data(), bwdDKScaleScratch_.data());
+                        const auto wdownStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                        linear_backward_bitnet_i2s_packed(
+                            dActChunk,
+                            dXChunk,
+                            layers_[L].Wdown_q,
+                            rows,
+                            wdownBwdTileRows,
+                            bwdDY8Scratch_.data(),
+                            bwdDYScaleScratch_.data(),
+                            chunkI2sMask,
+                            chunkI2sActivePrefixT,
+                            true);
+                        if (profile) prof.bwdFfnWdownMs += elapsedMs(wdownStart);
 
+                        const auto siluStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                        if (fastSiluBackwardEnabled()) {
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
-            for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
-                const std::size_t t = static_cast<std::size_t>(t_i);
-                if (attentionMask[t] == 0) continue;
-                rmsnorm_backward(
-                    &dXin_[t * H],
-                    &dXnormFfn_[t * H],
-                    &x_mid_[t * H],
-                    layers_[L].rms_ffn.data(),
-                    H, eps
-                );
+                            for (int t_i = 0; t_i < static_cast<int>(rows); ++t_i) {
+                                const std::size_t t = static_cast<std::size_t>(t_i);
+                                float* dAct_t = dActChunk + t * F;
+                                float* dGate_t = dGateChunk + t * F;
+                                float* dUp_t = dUpChunk + t * F;
+                                const float* gate_t = gateChunk + t * F;
+                                const float* up_t = upChunk + t * F;
 
-                float* dXmid_t = &dXmid_[t * H];
-                const float* dXmidFromNorm_t = &dXin_[t * H];
-                for (std::size_t h = 0; h < H; ++h) dXmid_t[h] += dXmidFromNorm_t[h];
+                                if (chunkActiveMask && chunkActiveMask[t] == 0) {
+                                    std::fill(dAct_t, dAct_t + F, 0.0f);
+                                    std::fill(dGate_t, dGate_t + F, 0.0f);
+                                    std::fill(dUp_t, dUp_t + F, 0.0f);
+                                    continue;
+                                }
+                                silu_backward_avx2_or_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+                            }
+                        }
+                        else if (exactSiluBackwardChunkedEnabled()) {
+                            silu_backward_exact_chunked(
+                                dGateChunk,
+                                dUpChunk,
+                                dActChunk,
+                                gateChunk,
+                                upChunk,
+                                rows,
+                                F,
+                                chunkActiveMask);
+                        }
+                        else {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                            for (int t_i = 0; t_i < static_cast<int>(rows); ++t_i) {
+                                const std::size_t t = static_cast<std::size_t>(t_i);
+                                float* dAct_t = dActChunk + t * F;
+                                float* dGate_t = dGateChunk + t * F;
+                                float* dUp_t = dUpChunk + t * F;
+                                const float* gate_t = gateChunk + t * F;
+                                const float* up_t = upChunk + t * F;
+                                if (chunkActiveMask && chunkActiveMask[t] == 0) {
+                                    std::fill(dAct_t, dAct_t + F, 0.0f);
+                                    std::fill(dGate_t, dGate_t + F, 0.0f);
+                                    std::fill(dUp_t, dUp_t + F, 0.0f);
+                                    continue;
+                                }
+                                silu_backward_exact_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+                            }
+                        }
+                        if (profile) prof.bwdFfnSiluMs += elapsedMs(siluStart);
+
+                        const auto dualStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                        linear_fused_dual_backward_bitnet_i2s_packed(
+                            dXnormFfnChunk,
+                            dUpChunk, dGateChunk,
+                            layers_[L].Wup_q, layers_[L].Wgate_q,
+                            rows, tTile,
+                            bwdDY8Scratch_.data(), bwdDYScaleScratch_.data(),
+                            bwdDK8Scratch_.data(), bwdDKScaleScratch_.data(),
+                            chunkI2sMask, chunkI2sActivePrefixT,
+                            false);
+                        if (profile) prof.bwdFfnDualMs += elapsedMs(dualStart);
+
+                        const auto normStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                        for (int t_i = 0; t_i < static_cast<int>(rows); ++t_i) {
+                            const std::size_t t = static_cast<std::size_t>(t_i);
+                            if (chunkActiveMask && chunkActiveMask[t] == 0) continue;
+                            if (useRmsnormBwdAccum) {
+                                rmsnorm_backward_accum(
+                                    dXmidChunk + t * H,
+                                    dXnormFfnChunk + t * H,
+                                    xMidChunk + t * H,
+                                    layers_[L].rms_ffn.data(),
+                                    H,
+                                    eps);
+                            }
+                            else {
+                                rmsnorm_backward(
+                                    dXinChunk + t * H,
+                                    dXnormFfnChunk + t * H,
+                                    xMidChunk + t * H,
+                                    layers_[L].rms_ffn.data(),
+                                    H,
+                                    eps);
+
+                                float* dXmid_t = dXmidChunk + t * H;
+                                const float* dResidual_t = dXChunk + t * H;
+                                const float* dXmidFromNorm_t = dXinChunk + t * H;
+                                for (std::size_t h = 0; h < H; ++h) {
+                                    dXmid_t[h] = fuseFfnResidualAdd
+                                        ? (dResidual_t[h] + dXmidFromNorm_t[h])
+                                        : (dXmid_t[h] + dXmidFromNorm_t[h]);
+                                }
+                            }
+                        }
+                        if (profile) prof.bwdFfnNormMs += elapsedMs(normStart);
+                    }
+                }
+                else {
+                    const std::size_t wdownBwdTileRows = exactWdownBackwardTileRows(activeComputeT, tTile);
+                    const auto wdownStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                    linear_backward_bitnet_i2s_packed(
+                        dAct_.data(),
+                        dX_.data(),
+                        layers_[L].Wdown_q,
+                        activeComputeT,
+                        wdownBwdTileRows,
+                        bwdDY8Scratch_.data(),
+                        bwdDYScaleScratch_.data(),
+                        i2sAttentionMask,
+                        i2sActivePrefixT,
+                        true);
+                    if (profile) prof.bwdFfnWdownMs += elapsedMs(wdownStart);
+
+                    const auto siluStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                    if (fastSiluBackwardEnabled()) {
+                        if (usePrefixMaskFastpath) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                            for (int t_i = 0; t_i < static_cast<int>(activePrefixT); ++t_i) {
+                                const std::size_t t = static_cast<std::size_t>(t_i);
+                                float* dAct_t = &dAct_[t * F];
+                                float* dGate_t = &dGate_[t * F];
+                                float* dUp_t = &dUp_[t * F];
+                                const float* gate_t = ffnGate + t * F;
+                                const float* up_t = ffnUp + t * F;
+                                silu_backward_avx2_or_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+                            }
+                            if (activePrefixT < activeComputeT) {
+                                const std::size_t tailOffset = activePrefixT * F;
+                                const std::size_t tailCount = (activeComputeT - activePrefixT) * F;
+                                std::fill_n(dAct_.data() + tailOffset, tailCount, 0.0f);
+                                std::fill_n(dGate_.data() + tailOffset, tailCount, 0.0f);
+                                std::fill_n(dUp_.data() + tailOffset, tailCount, 0.0f);
+                            }
+                        }
+                        else {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                            for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
+                                const std::size_t t = static_cast<std::size_t>(t_i);
+                                float* dAct_t = &dAct_[t * F];
+                                float* dGate_t = &dGate_[t * F];
+                                float* dUp_t = &dUp_[t * F];
+                                const float* gate_t = ffnGate + t * F;
+                                const float* up_t = ffnUp + t * F;
+
+                                if (attentionMask[t] == 0) {
+                                    std::fill(dAct_t, dAct_t + F, 0.0f);
+                                    std::fill(dGate_t, dGate_t + F, 0.0f);
+                                    std::fill(dUp_t, dUp_t + F, 0.0f);
+                                    continue;
+                                }
+                                silu_backward_avx2_or_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+                            }
+                        }
+                    }
+                    else {
+                        if (exactSiluBackwardChunkedEnabled()) {
+                            silu_backward_exact_chunked(
+                                dGate_.data(),
+                                dUp_.data(),
+                                dAct_.data(),
+                                ffnGate,
+                                ffnUp,
+                                T,
+                                F,
+                                attentionMask.data());
+                        }
+                        else {
+                            if (usePrefixMaskFastpath) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                                for (int t_i = 0; t_i < static_cast<int>(activePrefixT); ++t_i) {
+                                    const std::size_t t = static_cast<std::size_t>(t_i);
+                                    float* dAct_t = &dAct_[t * F];
+                                    float* dGate_t = &dGate_[t * F];
+                                    float* dUp_t = &dUp_[t * F];
+                                    const float* gate_t = ffnGate + t * F;
+                                    const float* up_t = ffnUp + t * F;
+                                    silu_backward_exact_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+                                }
+                                if (activePrefixT < activeComputeT) {
+                                    const std::size_t tailOffset = activePrefixT * F;
+                                    const std::size_t tailCount = (activeComputeT - activePrefixT) * F;
+                                    std::fill_n(dAct_.data() + tailOffset, tailCount, 0.0f);
+                                    std::fill_n(dGate_.data() + tailOffset, tailCount, 0.0f);
+                                    std::fill_n(dUp_.data() + tailOffset, tailCount, 0.0f);
+                                }
+                            }
+                            else {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                                for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
+                                    const std::size_t t = static_cast<std::size_t>(t_i);
+                                    float* dAct_t = &dAct_[t * F];
+                                    float* dGate_t = &dGate_[t * F];
+                                    float* dUp_t = &dUp_[t * F];
+                                    const float* gate_t = ffnGate + t * F;
+                                    const float* up_t = ffnUp + t * F;
+                                    if (attentionMask[t] == 0) {
+                                        std::fill(dAct_t, dAct_t + F, 0.0f);
+                                        std::fill(dGate_t, dGate_t + F, 0.0f);
+                                        std::fill(dUp_t, dUp_t + F, 0.0f);
+                                        continue;
+                                    }
+                                    silu_backward_exact_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+                                }
+                            }
+                        }
+                    }
+                    if (profile) prof.bwdFfnSiluMs += elapsedMs(siluStart);
+
+                    const auto dualStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+                    linear_fused_dual_backward_bitnet_i2s_packed(
+                        dXnormFfn_.data(),
+                        dUp_.data(), dGate_.data(),
+                        layers_[L].Wup_q, layers_[L].Wgate_q,
+                        activeComputeT, tTile,
+                        bwdDY8Scratch_.data(), bwdDYScaleScratch_.data(),
+                        bwdDK8Scratch_.data(), bwdDKScaleScratch_.data(),
+                        i2sAttentionMask, i2sActivePrefixT,
+                        false);
+                    if (profile) prof.bwdFfnDualMs += elapsedMs(dualStart);
+
+                    const auto normStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                    for (int t_i = 0; t_i < static_cast<int>(activeComputeT); ++t_i) {
+                        const std::size_t t = static_cast<std::size_t>(t_i);
+                        if (activeAttentionMask && activeAttentionMask[t] == 0) continue;
+                        if (useRmsnormBwdAccum) {
+                            rmsnorm_backward_accum(
+                                &dXmid_[t * H],
+                                &dXnormFfn_[t * H],
+                                ffnXmid + t * H,
+                                layers_[L].rms_ffn.data(),
+                                H, eps
+                            );
+                        }
+                        else {
+                            rmsnorm_backward(
+                                &dXin_[t * H],
+                                &dXnormFfn_[t * H],
+                                ffnXmid + t * H,
+                                layers_[L].rms_ffn.data(),
+                                H, eps
+                            );
+
+                            float* dXmid_t = &dXmid_[t * H];
+                            const float* dResidual_t = &dX_[t * H];
+                            const float* dXmidFromNorm_t = &dXin_[t * H];
+                            for (std::size_t h = 0; h < H; ++h) {
+                                dXmid_t[h] = fuseFfnResidualAdd
+                                    ? (dResidual_t[h] + dXmidFromNorm_t[h])
+                                    : (dXmid_t[h] + dXmidFromNorm_t[h]);
+                            }
+                        }
+                    }
+                    if (profile) prof.bwdFfnNormMs += elapsedMs(normStart);
+                }
             }
         }
         else if (useFfnGemm) {
@@ -1934,28 +3115,58 @@ void CpuKernelBackend::backward(
                 layers_[L].Wdown.data(),
                 T, H, F, cfg_.hTile, tTile);
 
+            if (fastSiluBackwardEnabled()) {
 #if defined(_OPENMP)
 #pragma omp parallel for schedule(static)
 #endif
-            for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
-                const std::size_t t = static_cast<std::size_t>(t_i);
-                float* dAct_t = &dAct_[t * F];
-                float* dGate_t = &dGate_[t * F];
-                float* dUp_t = &dUp_[t * F];
-                const float* gate_t = &gate_[t * F];
-                const float* up_t = &up_[t * F];
+                for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
+                    const std::size_t t = static_cast<std::size_t>(t_i);
+                    float* dAct_t = &dAct_[t * F];
+                    float* dGate_t = &dGate_[t * F];
+                    float* dUp_t = &dUp_[t * F];
+                    const float* gate_t = ffnGate + t * F;
+                    const float* up_t = ffnUp + t * F;
 
-                if (attentionMask[t] == 0) {
-                    std::fill(dAct_t, dAct_t + F, 0.0f);
-                    std::fill(dGate_t, dGate_t + F, 0.0f);
-                    std::fill(dUp_t, dUp_t + F, 0.0f);
-                    continue;
-                }
-                if (fastSiluBackwardEnabled()) {
+                    if (attentionMask[t] == 0) {
+                        std::fill(dAct_t, dAct_t + F, 0.0f);
+                        std::fill(dGate_t, dGate_t + F, 0.0f);
+                        std::fill(dUp_t, dUp_t + F, 0.0f);
+                        continue;
+                    }
                     silu_backward_avx2_or_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
                 }
+            }
+            else {
+                if (exactSiluBackwardChunkedEnabled()) {
+                    silu_backward_exact_chunked(
+                        dGate_.data(),
+                        dUp_.data(),
+                        dAct_.data(),
+                        ffnGate,
+                        ffnUp,
+                        T,
+                        F,
+                        attentionMask.data());
+                }
                 else {
-                    silu_backward_exact_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+                    for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
+                        const std::size_t t = static_cast<std::size_t>(t_i);
+                        float* dAct_t = &dAct_[t * F];
+                        float* dGate_t = &dGate_[t * F];
+                        float* dUp_t = &dUp_[t * F];
+                        const float* gate_t = ffnGate + t * F;
+                        const float* up_t = ffnUp + t * F;
+                        if (attentionMask[t] == 0) {
+                            std::fill(dAct_t, dAct_t + F, 0.0f);
+                            std::fill(dGate_t, dGate_t + F, 0.0f);
+                            std::fill(dUp_t, dUp_t + F, 0.0f);
+                            continue;
+                        }
+                        silu_backward_exact_scalar(dGate_t, dUp_t, dAct_t, gate_t, up_t, F);
+                    }
                 }
             }
 
@@ -1973,17 +3184,28 @@ void CpuKernelBackend::backward(
             for (int t_i = 0; t_i < static_cast<int>(T); ++t_i) {
                 const std::size_t t = static_cast<std::size_t>(t_i);
                 if (attentionMask[t] == 0) continue;
-                rmsnorm_backward(
-                    &dXin_[t * H],
-                    &dXnormFfn_[t * H],
-                    &x_mid_[t * H],
-                    layers_[L].rms_ffn.data(),
-                    H, eps
-                );
+                if (useRmsnormBwdAccum) {
+                    rmsnorm_backward_accum(
+                        &dXmid_[t * H],
+                        &dXnormFfn_[t * H],
+                        ffnXmid + t * H,
+                        layers_[L].rms_ffn.data(),
+                        H, eps
+                    );
+                }
+                else {
+                    rmsnorm_backward(
+                        &dXin_[t * H],
+                        &dXnormFfn_[t * H],
+                        ffnXmid + t * H,
+                        layers_[L].rms_ffn.data(),
+                        H, eps
+                    );
 
-                float* dXmid_t = &dXmid_[t * H];
-                const float* dXmidFromNorm_t = &dXin_[t * H];
-                for (std::size_t h = 0; h < H; ++h) dXmid_t[h] += dXmidFromNorm_t[h];
+                    float* dXmid_t = &dXmid_[t * H];
+                    const float* dXmidFromNorm_t = &dXin_[t * H];
+                    for (std::size_t h = 0; h < H; ++h) dXmid_t[h] += dXmidFromNorm_t[h];
+                }
             }
         }
         else {
@@ -2003,8 +3225,8 @@ void CpuKernelBackend::backward(
                         float* dGate_t = &dGate_[t * F];
                         float* dUp_t = &dUp_[t * F];
                         float* dXnFfn_t = &dXnormFfn_[t * H];
-                        const float* gate_t = &gate_[t * F];
-                        const float* up_t = &up_[t * F];
+                        const float* gate_t = ffnGate + t * F;
+                        const float* up_t = ffnUp + t * F;
 
                         for (std::size_t f = 0; f < F; ++f) {
                             const float* wDownRow = &layers_[L].Wdown[f * H];
@@ -2027,17 +3249,28 @@ void CpuKernelBackend::backward(
                             dXnFfn_t[h] = upDot + gateDot;
                         }
 
-                        rmsnorm_backward(
-                            &dXin_[t * H],
-                            dXnFfn_t,
-                            &x_mid_[t * H],
-                            layers_[L].rms_ffn.data(),
-                            H, eps
-                        );
+                        if (useRmsnormBwdAccum) {
+                            rmsnorm_backward_accum(
+                                &dXmid_[t * H],
+                                dXnFfn_t,
+                                ffnXmid + t * H,
+                                layers_[L].rms_ffn.data(),
+                                H, eps
+                            );
+                        }
+                        else {
+                            rmsnorm_backward(
+                                &dXin_[t * H],
+                                dXnFfn_t,
+                                ffnXmid + t * H,
+                                layers_[L].rms_ffn.data(),
+                                H, eps
+                            );
 
-                        float* dXmid_t = &dXmid_[t * H];
-                        const float* dXmidFromNorm_t = &dXin_[t * H];
-                        for (std::size_t h = 0; h < H; ++h) dXmid_t[h] += dXmidFromNorm_t[h];
+                            float* dXmid_t = &dXmid_[t * H];
+                            const float* dXmidFromNorm_t = &dXin_[t * H];
+                            for (std::size_t h = 0; h < H; ++h) dXmid_t[h] += dXmidFromNorm_t[h];
+                        }
                     }
                     continue;
                 }
@@ -2062,14 +3295,14 @@ void CpuKernelBackend::backward(
                 float* dXn1 = &dXnormFfn_[(t0 + 1) * H];
                 float* dXn2 = &dXnormFfn_[(t0 + 2) * H];
                 float* dXn3 = &dXnormFfn_[(t0 + 3) * H];
-                const float* gate0 = &gate_[(t0 + 0) * F];
-                const float* gate1 = &gate_[(t0 + 1) * F];
-                const float* gate2 = &gate_[(t0 + 2) * F];
-                const float* gate3 = &gate_[(t0 + 3) * F];
-                const float* up0 = &up_[(t0 + 0) * F];
-                const float* up1 = &up_[(t0 + 1) * F];
-                const float* up2 = &up_[(t0 + 2) * F];
-                const float* up3 = &up_[(t0 + 3) * F];
+                const float* gate0 = ffnGate + (t0 + 0) * F;
+                const float* gate1 = ffnGate + (t0 + 1) * F;
+                const float* gate2 = ffnGate + (t0 + 2) * F;
+                const float* gate3 = ffnGate + (t0 + 3) * F;
+                const float* up0 = ffnUp + (t0 + 0) * F;
+                const float* up1 = ffnUp + (t0 + 1) * F;
+                const float* up2 = ffnUp + (t0 + 2) * F;
+                const float* up3 = ffnUp + (t0 + 3) * F;
 
                 for (std::size_t f = 0; f < F; ++f) {
                     float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
@@ -2102,53 +3335,95 @@ void CpuKernelBackend::backward(
                     dXn3[h] = (attentionMask[t0 + 3] == 0) ? 0.0f : (upDot3 + gateDot3);
                 }
 
-                if (attentionMask[t0 + 0] != 0) rmsnorm_backward(&dXin_[(t0 + 0) * H], dXn0, &x_mid_[(t0 + 0) * H], layers_[L].rms_ffn.data(), H, eps);
-                if (attentionMask[t0 + 1] != 0) rmsnorm_backward(&dXin_[(t0 + 1) * H], dXn1, &x_mid_[(t0 + 1) * H], layers_[L].rms_ffn.data(), H, eps);
-                if (attentionMask[t0 + 2] != 0) rmsnorm_backward(&dXin_[(t0 + 2) * H], dXn2, &x_mid_[(t0 + 2) * H], layers_[L].rms_ffn.data(), H, eps);
-                if (attentionMask[t0 + 3] != 0) rmsnorm_backward(&dXin_[(t0 + 3) * H], dXn3, &x_mid_[(t0 + 3) * H], layers_[L].rms_ffn.data(), H, eps);
+                if (useRmsnormBwdAccum) {
+                    if (attentionMask[t0 + 0] != 0) rmsnorm_backward_accum(&dXmid_[(t0 + 0) * H], dXn0, ffnXmid + (t0 + 0) * H, layers_[L].rms_ffn.data(), H, eps);
+                    if (attentionMask[t0 + 1] != 0) rmsnorm_backward_accum(&dXmid_[(t0 + 1) * H], dXn1, ffnXmid + (t0 + 1) * H, layers_[L].rms_ffn.data(), H, eps);
+                    if (attentionMask[t0 + 2] != 0) rmsnorm_backward_accum(&dXmid_[(t0 + 2) * H], dXn2, ffnXmid + (t0 + 2) * H, layers_[L].rms_ffn.data(), H, eps);
+                    if (attentionMask[t0 + 3] != 0) rmsnorm_backward_accum(&dXmid_[(t0 + 3) * H], dXn3, ffnXmid + (t0 + 3) * H, layers_[L].rms_ffn.data(), H, eps);
+                }
+                else {
+                    if (attentionMask[t0 + 0] != 0) rmsnorm_backward(&dXin_[(t0 + 0) * H], dXn0, ffnXmid + (t0 + 0) * H, layers_[L].rms_ffn.data(), H, eps);
+                    if (attentionMask[t0 + 1] != 0) rmsnorm_backward(&dXin_[(t0 + 1) * H], dXn1, ffnXmid + (t0 + 1) * H, layers_[L].rms_ffn.data(), H, eps);
+                    if (attentionMask[t0 + 2] != 0) rmsnorm_backward(&dXin_[(t0 + 2) * H], dXn2, ffnXmid + (t0 + 2) * H, layers_[L].rms_ffn.data(), H, eps);
+                    if (attentionMask[t0 + 3] != 0) rmsnorm_backward(&dXin_[(t0 + 3) * H], dXn3, ffnXmid + (t0 + 3) * H, layers_[L].rms_ffn.data(), H, eps);
 
-                if (attentionMask[t0 + 0] != 0) for (std::size_t h = 0; h < H; ++h) dXmid_[(t0 + 0) * H + h] += dXin_[(t0 + 0) * H + h];
-                if (attentionMask[t0 + 1] != 0) for (std::size_t h = 0; h < H; ++h) dXmid_[(t0 + 1) * H + h] += dXin_[(t0 + 1) * H + h];
-                if (attentionMask[t0 + 2] != 0) for (std::size_t h = 0; h < H; ++h) dXmid_[(t0 + 2) * H + h] += dXin_[(t0 + 2) * H + h];
-                if (attentionMask[t0 + 3] != 0) for (std::size_t h = 0; h < H; ++h) dXmid_[(t0 + 3) * H + h] += dXin_[(t0 + 3) * H + h];
+                    if (attentionMask[t0 + 0] != 0) for (std::size_t h = 0; h < H; ++h) dXmid_[(t0 + 0) * H + h] += dXin_[(t0 + 0) * H + h];
+                    if (attentionMask[t0 + 1] != 0) for (std::size_t h = 0; h < H; ++h) dXmid_[(t0 + 1) * H + h] += dXin_[(t0 + 1) * H + h];
+                    if (attentionMask[t0 + 2] != 0) for (std::size_t h = 0; h < H; ++h) dXmid_[(t0 + 2) * H + h] += dXin_[(t0 + 2) * H + h];
+                    if (attentionMask[t0 + 3] != 0) for (std::size_t h = 0; h < H; ++h) dXmid_[(t0 + 3) * H + h] += dXin_[(t0 + 3) * H + h];
+                }
             }
         }
         if (profile) prof.bwdFfnMs += elapsedMs(ffnStart);
 
         // x_mid = x_in + attn_out, so attn branch receives dXmid.
         const auto attnTailStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
-        for (std::size_t i = 0; i < T * H; ++i) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (std::size_t i = 0; i < activeThSize; ++i) {
             dAttn_[i] = dXmid_[i];
         }
+        const float* const woGradSrc = dAttn_.data();
 
+        double woBwdMs = 0.0;
+        double attnCoreBwdMs = 0.0;
+        double ropeBwdMs = 0.0;
+        double loraBwdMs = 0.0;
+        double qkvBwdMs = 0.0;
+        double residualBwdMs = 0.0;
+
+        const auto woBwdStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         if (useI2SWo) {
             const std::size_t nYBlocks = layers_[L].Wo_q.nJBlocks();
             (void)nYBlocks;
             // dAttn rows are H-wide; nJBlocks = ceil(H/jq). bwdDY* are sized to
             // ceil(V/jq) which is always >= ceil(H/jq) since V >= H.
-            linear_backward_bitnet_i2s_packed(dCtx_.data(), dAttn_.data(), layers_[L].Wo_q, T, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data());
+            linear_backward_bitnet_i2s_packed(
+                dCtx_.data(),
+                woGradSrc,
+                layers_[L].Wo_q,
+                activeComputeT,
+                tTile,
+                bwdDY8Scratch_.data(),
+                bwdDYScaleScratch_.data(),
+                i2sAttentionMask,
+                i2sActivePrefixT,
+                useWoBackwardOverwrite);
         }
         else {
             for (std::size_t t = 0; t < T; ++t) {
                 if (attentionMask[t] == 0) continue;
-                const float* dat = &dAttn_[t * H]; float* dct = &dCtx_[t * H];
+                const float* dat = woGradSrc + t * H; float* dct = &dCtx_[t * H];
                 for (std::size_t i = 0; i < H; ++i) {
                     float sum = 0; for (std::size_t j = 0; j < H; ++j) sum += dat[j] * layers_[L].Wo[i * H + j]; dct[i] += sum;
                 }
             }
         }
+        if (profile) {
+            woBwdMs = elapsedMs(woBwdStart);
+            prof.bwdWoMs += woBwdMs;
+        }
 
+        const auto attnCoreBwdStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         attn_causal_backward(
             dQ_.data(), dK_.data(), dV_.data(),
             dCtx_.data(),
-            q_.data(), k_.data(), v_.data(),
-            T, H, shape_.nHeads, nKvHeads, probs_.data(),
-            attentionMask.data(), tmpdP_.data()
+            attnQ, attnK, attnV,
+            activeComputeT, H, shape_.nHeads, nKvHeads, attnProbs,
+            activeAttentionMask, tmpdP_.data()
         );
+        if (profile) {
+            attnCoreBwdMs = elapsedMs(attnCoreBwdStart);
+        }
 
         // Backprop through RoPE: d(pre-rope Q/K) = R(theta)^T * d(post-rope Q/K).
-        for (std::size_t t = 0; t < T; ++t) {
-            if (attentionMask[t] == 0) continue;
+        const auto ropeBwdStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (std::size_t t = 0; t < activeComputeT; ++t) {
+            if (activeAttentionMask && activeAttentionMask[t] == 0) continue;
             for (std::size_t h = 0; h < nHeads; ++h) {
                 apply_rope_backward_inplace(&dQ_[t * H + h * D], D, ropeDim, t, ropeTheta);
             }
@@ -2156,104 +3431,243 @@ void CpuKernelBackend::backward(
                 apply_rope_backward_inplace(&dK_[t * kvDim + kvh * D], D, ropeDim, t, ropeTheta);
             }
         }
+        if (profile) {
+            ropeBwdMs = elapsedMs(ropeBwdStart);
+            prof.bwdRopeMs += ropeBwdMs;
+        }
 
         // ── LoRA gradient accumulation ────────────────────────────────────────
         auto& gL = loraGrads_[L];
+        const auto loraBwdStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+#if defined(_OPENMP)
+        if (parallelAttentionLoraBackwardEnabled(activeComputeT) && activeComputeT > 1) {
+            const int threadCount = omp_get_max_threads();
+            const std::size_t gradAqSize = gL.gradAq.size();
+            const std::size_t gradBqSize = gL.gradBq.size();
+            const std::size_t gradAvSize = gL.gradAv.size();
+            const std::size_t gradBvSize = gL.gradBv.size();
 
-        for (std::size_t t = 0; t < T; ++t) {
-            if (attentionMask[t] == 0) continue;
+            std::vector<float> gradAqLocal(static_cast<std::size_t>(threadCount) * gradAqSize, 0.0f);
+            std::vector<float> gradBqLocal(static_cast<std::size_t>(threadCount) * gradBqSize, 0.0f);
+            std::vector<float> gradAvLocal(static_cast<std::size_t>(threadCount) * gradAvSize, 0.0f);
+            std::vector<float> gradBvLocal(static_cast<std::size_t>(threadCount) * gradBvSize, 0.0f);
+            std::vector<float> tmpRankLocal(static_cast<std::size_t>(threadCount) * R, 0.0f);
 
-            const float* xnorm_t = &xnorm_[t * H];
-
-            // Q LoRA grads
+#pragma omp parallel
             {
-                const float* dy = &dQ_[t * H];
-                const float* tmp = &tmpQ_cache_[((L * cfg_.maxSeqLen) + t) * R];
-                const float* B = loras_[L].Bq.data();
-                const float* A = loras_[L].Aq.data();
+                const int tid = omp_get_thread_num();
+                float* gradAqThread = gradAqLocal.data() + static_cast<std::size_t>(tid) * gradAqSize;
+                float* gradBqThread = gradBqLocal.data() + static_cast<std::size_t>(tid) * gradBqSize;
+                float* gradAvThread = gradAvLocal.data() + static_cast<std::size_t>(tid) * gradAvSize;
+                float* gradBvThread = gradBvLocal.data() + static_cast<std::size_t>(tid) * gradBvSize;
+                float* tmpRank = tmpRankLocal.data() + static_cast<std::size_t>(tid) * R;
 
-                for (std::size_t r = 0; r < R; ++r) {
-                    const float  tr = scale * tmp[r];
-                    float* gBrow = &gL.gradBq[r * H];
-                    const float* Brow = &B[r * H];
-                    axpy_inplace_avx2_or_scalar(gBrow, dy, H, tr);
-                    dTmpRank_[r] = scale * dot_avx2_or_scalar(Brow, dy, H);
-                }
+#pragma omp for schedule(static)
+                for (int t_i = 0; t_i < static_cast<int>(activeComputeT); ++t_i) {
+                    const std::size_t t = static_cast<std::size_t>(t_i);
+                    if (activeAttentionMask && activeAttentionMask[t] == 0) continue;
 
-                for (std::size_t r = 0; r < R; ++r) {
-                    const float  dtr = dTmpRank_[r];
-                    float* gArow = &gL.gradAq[r * H];
-                    axpy_inplace_avx2_or_scalar(gArow, xnorm_t, H, dtr);
-                }
+                    const float* xnorm_t = attnXnorm + t * H;
 
-                float* dxn = &dXnorm_[t * H];
-                for (std::size_t r = 0; r < R; ++r) {
-                    const float  dr = dTmpRank_[r];
-                    const float* Arow = &A[r * H];
-                    axpy_inplace_avx2_or_scalar(dxn, Arow, H, dr);
+                    // Q LoRA grads
+                    {
+                        const float* dy = &dQ_[t * H];
+                        const float* tmp = &tmpQ_cache_[((L * cfg_.maxSeqLen) + t) * R];
+                        const float* B = loras_[L].Bq.data();
+                        const float* A = loras_[L].Aq.data();
+
+                        for (std::size_t r = 0; r < R; ++r) {
+                            const float tr = scale * tmp[r];
+                            float* gBrow = gradBqThread + r * H;
+                            const float* Brow = &B[r * H];
+                            axpy_inplace_avx2_or_scalar(gBrow, dy, H, tr);
+                            tmpRank[r] = scale * dot_avx2_or_scalar(Brow, dy, H);
+                        }
+
+                        for (std::size_t r = 0; r < R; ++r) {
+                            const float dtr = tmpRank[r];
+                            float* gArow = gradAqThread + r * H;
+                            axpy_inplace_avx2_or_scalar(gArow, xnorm_t, H, dtr);
+                        }
+
+                        float* dxn = &dXnorm_[t * H];
+                        for (std::size_t r = 0; r < R; ++r) {
+                            const float dr = tmpRank[r];
+                            const float* Arow = &A[r * H];
+                            axpy_inplace_avx2_or_scalar(dxn, Arow, H, dr);
+                        }
+                    }
+
+                    // V LoRA grads
+                    {
+                        const float* dyV = &dV_[t * kvDim];
+                        const float* tmpV = &tmpV_cache_[((L * cfg_.maxSeqLen) + t) * R];
+                        const float* Bv = loras_[L].Bv.data();
+                        const float* Av = loras_[L].Av.data();
+
+                        for (std::size_t r = 0; r < R; ++r) {
+                            const float tr = scale * tmpV[r];
+                            float* gBrow = gradBvThread + r * kvDim;
+                            const float* Brow = &Bv[r * kvDim];
+                            axpy_inplace_avx2_or_scalar(gBrow, dyV, kvDim, tr);
+                            tmpRank[r] = scale * dot_avx2_or_scalar(Brow, dyV, kvDim);
+                        }
+
+                        for (std::size_t r = 0; r < R; ++r) {
+                            const float dtr = tmpRank[r];
+                            float* gArow = gradAvThread + r * H;
+                            axpy_inplace_avx2_or_scalar(gArow, xnorm_t, H, dtr);
+                        }
+
+                        float* dxn = &dXnorm_[t * H];
+                        for (std::size_t r = 0; r < R; ++r) {
+                            const float dr = tmpRank[r];
+                            const float* Arow = &Av[r * H];
+                            axpy_inplace_avx2_or_scalar(dxn, Arow, H, dr);
+                        }
+                    }
                 }
             }
 
-            // V LoRA grads
-            {
-                const float* dyV = &dV_[t * kvDim];
-                const float* tmpV = &tmpV_cache_[((L * cfg_.maxSeqLen) + t) * R];
-                const float* Bv = loras_[L].Bv.data();
-                const float* Av = loras_[L].Av.data();
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < static_cast<int>(gradAqSize); ++i) {
+                float sum = 0.0f;
+                for (int tid = 0; tid < threadCount; ++tid) {
+                    sum += gradAqLocal[static_cast<std::size_t>(tid) * gradAqSize + static_cast<std::size_t>(i)];
+                }
+                gL.gradAq[static_cast<std::size_t>(i)] += sum;
+            }
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < static_cast<int>(gradBqSize); ++i) {
+                float sum = 0.0f;
+                for (int tid = 0; tid < threadCount; ++tid) {
+                    sum += gradBqLocal[static_cast<std::size_t>(tid) * gradBqSize + static_cast<std::size_t>(i)];
+                }
+                gL.gradBq[static_cast<std::size_t>(i)] += sum;
+            }
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < static_cast<int>(gradAvSize); ++i) {
+                float sum = 0.0f;
+                for (int tid = 0; tid < threadCount; ++tid) {
+                    sum += gradAvLocal[static_cast<std::size_t>(tid) * gradAvSize + static_cast<std::size_t>(i)];
+                }
+                gL.gradAv[static_cast<std::size_t>(i)] += sum;
+            }
+#pragma omp parallel for schedule(static)
+            for (int i = 0; i < static_cast<int>(gradBvSize); ++i) {
+                float sum = 0.0f;
+                for (int tid = 0; tid < threadCount; ++tid) {
+                    sum += gradBvLocal[static_cast<std::size_t>(tid) * gradBvSize + static_cast<std::size_t>(i)];
+                }
+                gL.gradBv[static_cast<std::size_t>(i)] += sum;
+            }
+        }
+        else
+#endif
+        {
+            for (std::size_t t = 0; t < activeComputeT; ++t) {
+                if (activeAttentionMask && activeAttentionMask[t] == 0) continue;
 
-                for (std::size_t r = 0; r < R; ++r) {
-                    const float  tr = scale * tmpV[r];
-                    float* gBrow = &gL.gradBv[r * kvDim];
-                    const float* Brow = &Bv[r * kvDim];
-                    axpy_inplace_avx2_or_scalar(gBrow, dyV, kvDim, tr);
-                    dTmpRank_[r] = scale * dot_avx2_or_scalar(Brow, dyV, kvDim);
+                const float* xnorm_t = attnXnorm + t * H;
+
+                // Q LoRA grads
+                {
+                    const float* dy = &dQ_[t * H];
+                    const float* tmp = &tmpQ_cache_[((L * cfg_.maxSeqLen) + t) * R];
+                    const float* B = loras_[L].Bq.data();
+                    const float* A = loras_[L].Aq.data();
+
+                    for (std::size_t r = 0; r < R; ++r) {
+                        const float  tr = scale * tmp[r];
+                        float* gBrow = &gL.gradBq[r * H];
+                        const float* Brow = &B[r * H];
+                        axpy_inplace_avx2_or_scalar(gBrow, dy, H, tr);
+                        dTmpRank_[r] = scale * dot_avx2_or_scalar(Brow, dy, H);
+                    }
+
+                    for (std::size_t r = 0; r < R; ++r) {
+                        const float  dtr = dTmpRank_[r];
+                        float* gArow = &gL.gradAq[r * H];
+                        axpy_inplace_avx2_or_scalar(gArow, xnorm_t, H, dtr);
+                    }
+
+                    float* dxn = &dXnorm_[t * H];
+                    for (std::size_t r = 0; r < R; ++r) {
+                        const float  dr = dTmpRank_[r];
+                        const float* Arow = &A[r * H];
+                        axpy_inplace_avx2_or_scalar(dxn, Arow, H, dr);
+                    }
                 }
 
-                for (std::size_t r = 0; r < R; ++r) {
-                    const float  dtr = dTmpRank_[r];
-                    float* gArow = &gL.gradAv[r * H];
-                    axpy_inplace_avx2_or_scalar(gArow, xnorm_t, H, dtr);
-                }
+                // V LoRA grads
+                {
+                    const float* dyV = &dV_[t * kvDim];
+                    const float* tmpV = &tmpV_cache_[((L * cfg_.maxSeqLen) + t) * R];
+                    const float* Bv = loras_[L].Bv.data();
+                    const float* Av = loras_[L].Av.data();
 
-                float* dxn = &dXnorm_[t * H];
-                for (std::size_t r = 0; r < R; ++r) {
-                    const float  dr = dTmpRank_[r];
-                    const float* Arow = &Av[r * H];
-                    axpy_inplace_avx2_or_scalar(dxn, Arow, H, dr);
+                    for (std::size_t r = 0; r < R; ++r) {
+                        const float  tr = scale * tmpV[r];
+                        float* gBrow = &gL.gradBv[r * kvDim];
+                        const float* Brow = &Bv[r * kvDim];
+                        axpy_inplace_avx2_or_scalar(gBrow, dyV, kvDim, tr);
+                        dTmpRank_[r] = scale * dot_avx2_or_scalar(Brow, dyV, kvDim);
+                    }
+
+                    for (std::size_t r = 0; r < R; ++r) {
+                        const float  dtr = dTmpRank_[r];
+                        float* gArow = &gL.gradAv[r * H];
+                        axpy_inplace_avx2_or_scalar(gArow, xnorm_t, H, dtr);
+                    }
+
+                    float* dxn = &dXnorm_[t * H];
+                    for (std::size_t r = 0; r < R; ++r) {
+                        const float  dr = dTmpRank_[r];
+                        const float* Arow = &Av[r * H];
+                        axpy_inplace_avx2_or_scalar(dxn, Arow, H, dr);
+                    }
                 }
             }
         }
+        if (profile) {
+            loraBwdMs = elapsedMs(loraBwdStart);
+            prof.bwdLoraMs += loraBwdMs;
+        }
 
         // ── Base weight backward into dXnorm_ ────────────────────────────────
+        const auto qkvBwdStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
         if (useFusedI2SQKV) {
+            const std::size_t fusedQkvBwdTileRows =
+                exactFusedQkvBackwardTileRows(activeComputeT, tTile);
             linear_fused_qkv_backward_bitnet_i2s_packed(
                 dXnorm_.data(),
                 dQ_.data(), dK_.data(), dV_.data(),
                 layers_[L].Wq_q, layers_[L].Wk_q, layers_[L].Wv_q,
-                T, tTile,
+                activeComputeT, fusedQkvBwdTileRows,
                 bwdDY8Scratch_.data(), bwdDYScaleScratch_.data(),
                 bwdDK8Scratch_.data(), bwdDKScaleScratch_.data(),
                 bwdDV8Scratch_.data(), bwdDVScaleScratch_.data());
         }
         else if (useI2SQ || useI2SK || useI2SV) {
             if (useI2SQ) {
-                linear_backward_bitnet_i2s_packed(dXnorm_.data(), dQ_.data(), layers_[L].Wq_q, T, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data());
+                linear_backward_bitnet_i2s_packed(dXnorm_.data(), dQ_.data(), layers_[L].Wq_q, activeComputeT, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
             }
             if (useFusedI2SKV) {
                 linear_fused_dual_backward_bitnet_i2s_packed(
                     dXnorm_.data(),
                     dK_.data(), dV_.data(),
                     layers_[L].Wk_q, layers_[L].Wv_q,
-                    T, tTile,
+                    activeComputeT, tTile,
                     bwdDY8Scratch_.data(), bwdDYScaleScratch_.data(),
-                    bwdDK8Scratch_.data(), bwdDKScaleScratch_.data());
+                    bwdDK8Scratch_.data(), bwdDKScaleScratch_.data(),
+                    i2sAttentionMask, i2sActivePrefixT);
             }
             else {
                 if (useI2SK) {
-                    linear_backward_bitnet_i2s_packed(dXnorm_.data(), dK_.data(), layers_[L].Wk_q, T, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data());
+                    linear_backward_bitnet_i2s_packed(dXnorm_.data(), dK_.data(), layers_[L].Wk_q, activeComputeT, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
                 }
                 if (useI2SV) {
-                    linear_backward_bitnet_i2s_packed(dXnorm_.data(), dV_.data(), layers_[L].Wv_q, T, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data());
+                    linear_backward_bitnet_i2s_packed(dXnorm_.data(), dV_.data(), layers_[L].Wv_q, activeComputeT, tTile, bwdDY8Scratch_.data(), bwdDYScaleScratch_.data(), i2sAttentionMask, i2sActivePrefixT);
                 }
             }
         }
@@ -2272,10 +3686,18 @@ void CpuKernelBackend::backward(
                 }
             }
         }
+        if (profile) {
+            qkvBwdMs = elapsedMs(qkvBwdStart);
+            prof.bwdQkvMs += qkvBwdMs;
+        }
 
         // ── FIX: Correct residual gradient accumulation ───────────────────────
-        for (std::size_t t = 0; t < T; ++t) {
-            if (attentionMask[t] == 0) continue;
+        const auto residualBwdStart = profile ? ProfileClock::now() : ProfileClock::time_point{};
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (std::size_t t = 0; t < activeComputeT; ++t) {
+            if (activeAttentionMask && activeAttentionMask[t] == 0) continue;
             // Step 1: compute the RMSNorm gradient into the zero-initialised dXin_
             rmsnorm_backward(
                 &dXin_[t * H],
@@ -2285,12 +3707,31 @@ void CpuKernelBackend::backward(
                 H, eps
             );
         }
-
+ 
         // Step 2: x_mid = x_in + attn_out, so dX_in = dX_mid + d(attn_path)/dx_in.
-        for (std::size_t i = 0; i < T * H; ++i) {
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static)
+#endif
+        for (std::size_t i = 0; i < activeThSize; ++i) {
             dX_[i] = dXmid_[i] + dXin_[i];
         }
-        if (profile) prof.bwdAttnMs += elapsedMs(attnTailStart);
+        if (profile) {
+            residualBwdMs = elapsedMs(residualBwdStart);
+            prof.bwdResidualMs += residualBwdMs;
+        }
+        if (profile) {
+            const double attnTailMs = elapsedMs(attnTailStart);
+            const double splitMs =
+                woBwdMs +
+                attnCoreBwdMs +
+                ropeBwdMs +
+                loraBwdMs +
+                qkvBwdMs +
+                residualBwdMs;
+            // Keep bwdAttnMs as the whole attention-tail bucket while the
+            // substage fields capture the newer breakdown.
+            prof.bwdAttnMs += std::max(attnTailMs, splitMs);
+        }
     }
 
     if (profile) printBackendProfile();

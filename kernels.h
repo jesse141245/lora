@@ -150,6 +150,65 @@ void lora_add_H(
     std::size_t hTile);
 
 // ===========================================================================
+// Fused QKV Forward (Float32)
+// ===========================================================================
+
+/**
+ * @brief Baseline fused projection for Query, Key, and Value matrices.
+ * @param Q Output Query matrix (size T x H).
+ * @param K Output Key matrix (size T x kvDim).
+ * @param V Output Value matrix (size T x kvDim).
+ * @param X Input hidden states (size T x H).
+ * @param Wq Query weights.
+ * @param Wk Key weights.
+ * @param Wv Value weights.
+ * @param T Sequence length.
+ * @param H Hidden dimension size.
+ * @param jTile Cache blocking size (width).
+ * @param tTile Cache blocking size (time).
+ */
+void linear_THH_fused_qkv(
+    float* __restrict Q, float* __restrict K, float* __restrict V,
+    const float* __restrict X,
+    const float* __restrict Wq, const float* __restrict Wk, const float* __restrict Wv,
+    std::size_t T, std::size_t H,
+    std::size_t jTile,
+    std::size_t tTile);
+
+/**
+ * @brief Accumulation variant of the fused QKV projection.
+ */
+void linear_THH_fused_qkv_accum(
+    float* __restrict Q, float* __restrict K, float* __restrict V,
+    const float* __restrict X,
+    const float* __restrict Wq, const float* __restrict Wk, const float* __restrict Wv,
+    std::size_t T, std::size_t H,
+    std::size_t jTile,
+    std::size_t tTile);
+
+/**
+ * @brief Highly optimized, 16-element AVX2 blocked fused QKV projection.
+ */
+void linear_THH_fused_qkv_accum_blocked16(
+    float* __restrict Q, float* __restrict K, float* __restrict V,
+    const float* __restrict X,
+    const float* __restrict Wq, const float* __restrict Wk, const float* __restrict Wv,
+    std::size_t T, std::size_t H,
+    std::size_t jTile,
+    std::size_t tTile);
+
+/**
+ * @brief Highly optimized, 32-element AVX2 blocked fused QKV projection.
+ */
+void linear_THH_fused_qkv_accum_blocked32(
+    float* __restrict Q, float* __restrict K, float* __restrict V,
+    const float* __restrict X,
+    const float* __restrict Wq, const float* __restrict Wk, const float* __restrict Wv,
+    std::size_t T, std::size_t H,
+    std::size_t jTile,
+    std::size_t tTile);
+
+// ===========================================================================
 // FFN GEMM Helpers
 // ===========================================================================
 
@@ -215,6 +274,116 @@ void linear_TFH_fused_dual_from_HF_blocked4(
     std::size_t F,
     std::size_t H,
     std::size_t hTile,
+    std::size_t tTile);
+
+// ===========================================================================
+// QKV Input Backward (Float32)
+// ===========================================================================
+
+/**
+ * @brief Computes the gradient of the input X with respect to the Q, K, and V gradients.
+ * Effectively: dX = dQ * Wq^T + dK * Wk^T + dV * Wv^T.
+ * @param dX Output gradient for the input (size T x H).
+ * @param dQ Incoming gradient for Queries.
+ * @param dK Incoming gradient for Keys.
+ * @param dV Incoming gradient for Values.
+ * @param Wq Query weights.
+ * @param Wk Key weights.
+ * @param Wv Value weights.
+ * @param T Sequence length.
+ * @param H Hidden dimension size.
+ * @param hTile Cache blocking size.
+ */
+void qkv_input_backward_THH(
+    float* __restrict dX,
+    const float* __restrict dQ,
+    const float* __restrict dK,
+    const float* __restrict dV,
+    const float* __restrict Wq,
+    const float* __restrict Wk,
+    const float* __restrict Wv,
+    std::size_t T, std::size_t H,
+    std::size_t hTile);
+
+// ===========================================================================
+// BitNet (1.58-bit Ternary) Kernels
+// ===========================================================================
+
+/**
+ * @brief Performs a linear projection using BitNet ternary quantized weights.
+ * @param Y Output matrix (size T x H).
+ * @param X Input matrix (size T x H).
+ * @param Wq BitNet quantized weight matrix containing scales and ternary int8 values.
+ * @param T Sequence length.
+ * @param H Hidden dimension size.
+ * @param jTile Cache blocking size.
+ */
+void linear_THH_bitnet(
+    float* __restrict Y,
+    const float* __restrict X,
+    const BitNetMat& Wq,
+    std::size_t T,
+    std::size_t H,
+    std::size_t jTile);
+
+/**
+ * @brief Computes the input gradient (dX) for the QKV projections using BitNet weights.
+ * @param dX Output gradient for the input (size T x H).
+ * @param dQ Incoming Query gradient.
+ * @param dK Incoming Key gradient.
+ * @param dV Incoming Value gradient.
+ * @param Wq BitNet Query weights.
+ * @param Wk BitNet Key weights.
+ * @param Wv BitNet Value weights.
+ * @param T Sequence length.
+ * @param H Hidden dimension size.
+ * @param hTile Cache blocking size.
+ */
+void qkv_input_backward_THH_bitnet(
+    float* __restrict dX,
+    const float* __restrict dQ,
+    const float* __restrict dK,
+    const float* __restrict dV,
+    const BitNetMat& Wq,
+    const BitNetMat& Wk,
+    const BitNetMat& Wv,
+    std::size_t T,
+    std::size_t H,
+    std::size_t hTile);
+
+/**
+ * @brief Fused QKV forward pass using BitNet ternary weights, blocked for AVX2.
+ */
+void linear_THH_fused_qkv_bitnet_accum_blocked32(
+    float* __restrict Q, float* __restrict K, float* __restrict V,
+    const float* __restrict X,
+    const BitNetMat& WqM, const BitNetMat& WkM, const BitNetMat& WvM,
+    std::size_t T, std::size_t H,
+    std::size_t jTile,
+    std::size_t tTile);
+
+/**
+ * @brief Accumulates the result of a transposed matrix-vector multiplication using BitNet weights.
+ */
+void linear_HH_T_accum_bitnet(
+    float* __restrict y,
+    const float* __restrict A,
+    const BitNetMat& WoM,
+    std::size_t H,
+    std::size_t hTile);
+
+/**
+ * @brief Backward pass for BitNet fused QKV, specifically generating the dX gradient, optimized with AVX2 blocking.
+ */
+void linear_THH_fused_qkv_bitnet_backward_dX_blocked32(
+    float* __restrict dX,
+    const float* __restrict dQ,
+    const float* __restrict dK,
+    const float* __restrict dV,
+    const BitNetMat& WqM, const BitNetMat& WkM, const BitNetMat& WvM,
+    std::size_t T, std::size_t H,
+    const int* __restrict attentionMask,
+    std::size_t iTile,
     std::size_t tTile);
 
 // ===========================================================================

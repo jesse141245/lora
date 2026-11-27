@@ -96,8 +96,8 @@ namespace {
                     throw std::runtime_error("Dataset: field 'attention_mask' must contain integers");
                 }
                 const int x = v.get<int>();
-                if (x != 0 && x != 1) {
-                    throw std::runtime_error("Dataset: attention_mask values must be 0 or 1");
+                if (x != 0 && x != 1 && x != 2) {
+                    throw std::runtime_error("Dataset: attention_mask values must be 0, 1, or packed-segment marker 2");
                 }
                 s.attentionMask.push_back(x);
             }

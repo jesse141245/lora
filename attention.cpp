@@ -93,11 +93,6 @@ static inline bool attn_d80_specialized_enabled() {
     return cached;
 }
 
-static inline bool attn_backward_head_parallel_enabled() {
-    static const bool cached = env_bool_or("QLORA_TEST_ATTN_BWD_HEAD_PARALLEL", false);
-    return cached;
-}
-
 static inline bool attn_fast_softmax_enabled() {
     static const bool cached = env_bool_or("QLORA_TEST_FAST_ATTN_SOFTMAX", false);
     return cached;
@@ -113,23 +108,85 @@ static inline bool attn_d128_weighted_sum_enabled() {
     return cached;
 }
 
+struct BoolEnvKnob {
+    const char* name;
+    bool defaultValue;
+};
+
+static constexpr BoolEnvKnob kAttnDqOverwriteD128Knob{
+    "QLORA_TEST_ATTN_DQ_OVERWRITE_D128",
+    true
+};
+static constexpr BoolEnvKnob kAttnBwdGroupLocalAccumKnob{
+    "QLORA_TEST_ATTN_BWD_GROUP_LOCAL_ACCUM",
+    false
+};
+static constexpr BoolEnvKnob kAttnBwdGroupLocalRowOverwriteKnob{
+    "QLORA_TEST_ATTN_BWD_GROUP_LOCAL_ROW_OVERWRITE",
+    false
+};
+static constexpr BoolEnvKnob kAttnBwdGroup4FusedD128Knob{
+    "QLORA_TEST_ATTN_BWD_GROUP4_FUSED_D128",
+    true
+};
+static constexpr BoolEnvKnob kAttnBwdGroup4RowOverwriteKnob{
+    "QLORA_TEST_ATTN_BWD_GROUP4_ROW_OVERWRITE",
+    false
+};
+static constexpr BoolEnvKnob kAttnBwdPrecomputeDsD128Knob{
+    "QLORA_TEST_ATTN_BWD_PRECOMPUTE_DS_D128",
+    false
+};
+static constexpr BoolEnvKnob kAttnBwdGroup4SplitDqDkvD128Knob{
+    "QLORA_TEST_ATTN_BWD_GROUP4_SPLIT_DQ_DKV_D128",
+    false
+};
+static constexpr BoolEnvKnob kAttnBwdHeadParallelKnob{
+    "QLORA_TEST_ATTN_BWD_HEAD_PARALLEL",
+    false
+};
+
+static inline bool env_bool_knob(const BoolEnvKnob& knob) {
+    return env_bool_or(knob.name, knob.defaultValue);
+}
+
+static inline bool attn_backward_head_parallel_enabled() {
+    static const bool cached = env_bool_knob(kAttnBwdHeadParallelKnob);
+    return cached;
+}
+
 static inline bool attn_dq_overwrite_d128_enabled() {
-    static const bool cached = env_bool_or("QLORA_TEST_ATTN_DQ_OVERWRITE_D128", true);
+    static const bool cached = env_bool_knob(kAttnDqOverwriteD128Knob);
     return cached;
 }
 
 static inline bool attn_backward_group_local_accum_enabled() {
-    static const bool cached = env_bool_or("QLORA_TEST_ATTN_BWD_GROUP_LOCAL_ACCUM", true);
+    static const bool cached = env_bool_knob(kAttnBwdGroupLocalAccumKnob);
     return cached;
 }
 
 static inline bool attn_backward_group_local_row_overwrite_enabled() {
-    static const bool cached = env_bool_or("QLORA_TEST_ATTN_BWD_GROUP_LOCAL_ROW_OVERWRITE", true);
+    static const bool cached = env_bool_knob(kAttnBwdGroupLocalRowOverwriteKnob);
     return cached;
 }
 
 static inline bool attn_backward_group4_fused_d128_enabled() {
-    static const bool cached = env_bool_or("QLORA_TEST_ATTN_BWD_GROUP4_FUSED_D128", false);
+    static const bool cached = env_bool_knob(kAttnBwdGroup4FusedD128Knob);
+    return cached;
+}
+
+static inline bool attn_backward_group4_row_overwrite_enabled() {
+    static const bool cached = env_bool_knob(kAttnBwdGroup4RowOverwriteKnob);
+    return cached;
+}
+
+static inline bool attn_backward_precompute_ds_d128_enabled() {
+    static const bool cached = env_bool_knob(kAttnBwdPrecomputeDsD128Knob);
+    return cached;
+}
+
+static inline bool attn_backward_group4_split_dq_dkv_d128_enabled() {
+    static const bool cached = env_bool_knob(kAttnBwdGroup4SplitDqDkvD128Knob);
     return cached;
 }
 
@@ -171,16 +228,49 @@ struct AttnBackwardOptions {
     bool enableGroupedLocalAccum;
     bool enableGroupedLocalRowOverwrite;
     bool enableGrouped4FusedD128;
+    bool enableGrouped4RowOverwrite;
+    bool enablePrecomputeDsD128;
+    bool enableGrouped4SplitDqDkvD128;
     bool enableHeadParallel;
 };
 
+static inline void normalize_attn_backward_options(AttnBackwardOptions& options) {
+    if (!options.enableGroupedLocalAccum) {
+        options.enableGroupedLocalRowOverwrite = false;
+        options.enableGrouped4FusedD128 = false;
+        options.enableGrouped4RowOverwrite = false;
+    }
+    if (!options.enableGrouped4FusedD128) {
+        options.enableGrouped4RowOverwrite = false;
+        options.enableGrouped4SplitDqDkvD128 = false;
+    }
+}
+
 static inline AttnBackwardOptions default_attn_backward_options() {
-    return AttnBackwardOptions{
+    AttnBackwardOptions options{
         attn_dq_overwrite_d128_enabled(),
         attn_backward_group_local_accum_enabled(),
         attn_backward_group_local_row_overwrite_enabled(),
         attn_backward_group4_fused_d128_enabled(),
+        attn_backward_group4_row_overwrite_enabled(),
+        attn_backward_precompute_ds_d128_enabled(),
+        attn_backward_group4_split_dq_dkv_d128_enabled(),
         attn_backward_head_parallel_enabled(),
+    };
+    normalize_attn_backward_options(options);
+    return options;
+}
+
+static inline AttnBackwardOptions baseline_attn_backward_options() {
+    return AttnBackwardOptions{
+        attn_dq_overwrite_d128_enabled(),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
     };
 }
 
@@ -194,16 +284,22 @@ static inline void apply_debug_candidate_overrides(AttnBackwardOptions& options)
     if (const auto override = env_bool_override("QLORA_TEST_ATTN_BWD_DEBUG_COMPARE_GROUP4_FUSED_D128")) {
         options.enableGrouped4FusedD128 = *override;
     }
+    if (const auto override = env_bool_override("QLORA_TEST_ATTN_BWD_DEBUG_COMPARE_GROUP4_ROW_OVERWRITE")) {
+        options.enableGrouped4RowOverwrite = *override;
+    }
+    if (const auto override = env_bool_override("QLORA_TEST_ATTN_BWD_DEBUG_COMPARE_PRECOMPUTE_DS_D128")) {
+        options.enablePrecomputeDsD128 = *override;
+    }
+    if (const auto override = env_bool_override("QLORA_TEST_ATTN_BWD_DEBUG_COMPARE_GROUP4_SPLIT_DQ_DKV_D128")) {
+        options.enableGrouped4SplitDqDkvD128 = *override;
+    }
     if (const auto override = env_bool_override("QLORA_TEST_ATTN_BWD_DEBUG_COMPARE_DQ_OVERWRITE_D128")) {
         options.enableDqOverwriteD128 = *override;
     }
     if (const auto override = env_bool_override("QLORA_TEST_ATTN_BWD_DEBUG_COMPARE_HEAD_PARALLEL")) {
         options.enableHeadParallel = *override;
     }
-    if (!options.enableGroupedLocalAccum) {
-        options.enableGroupedLocalRowOverwrite = false;
-        options.enableGrouped4FusedD128 = false;
-    }
+    normalize_attn_backward_options(options);
 }
 
 static inline void report_backward_diff(
@@ -582,8 +678,21 @@ void attn_causal(
     const std::size_t kvDim = nKvHeads * D;
     const float       inv_sqrt_d = 1.0f / std::sqrt(float(D));
     const std::size_t heads_per_group = nHeads / nKvHeads;
-    const bool allActive = !attentionMask ||
-        std::all_of(attentionMask, attentionMask + T, [](int v) { return v != 0; });
+    const bool segmented = attentionMask &&
+        std::any_of(attentionMask, attentionMask + T, [](int v) { return v > 1; });
+    std::vector<std::size_t> segmentStarts;
+    if (segmented) {
+        segmentStarts.resize(T, 0);
+        std::size_t currentStart = 0;
+        for (std::size_t t = 0; t < T; ++t) {
+            if (attentionMask[t] > 1) {
+                currentStart = t;
+            }
+            segmentStarts[t] = currentStart;
+        }
+    }
+    const bool allActive = !segmented && (!attentionMask ||
+        std::all_of(attentionMask, attentionMask + T, [](int v) { return v != 0; }));
     const bool useD128WeightedSum = allActive && D == 128 && attn_d128_weighted_sum_enabled();
     const bool fillTails = attn_fill_tails_enabled();
 
@@ -598,16 +707,18 @@ void attn_causal(
         const float* qt = q + t * H + h * D;
         float* pr = probs + (h * T * T) + (t * T);
         float* sc = scores ? (scores + (h * T * T) + (t * T)) : pr;
+        const std::size_t begin = segmented ? segmentStarts[t] : 0;
         const std::size_t prefix = t + 1;
+        const std::size_t count = prefix - begin;
 
         // ── Q·K scores ───────────────────────────────────────────────────
         if (allActive) {
-            for (std::size_t j = 0; j < prefix; ++j) {
+            for (std::size_t j = begin; j < prefix; ++j) {
                 sc[j] = dot_D(qt, k + j * kvDim + kv_h * D, D) * inv_sqrt_d;
             }
         }
         else {
-            for (std::size_t j = 0; j < prefix; ++j) {
+            for (std::size_t j = begin; j < prefix; ++j) {
                 if (attentionMask[j] == 0) {
                     sc[j] = -1e9f;
                     continue;
@@ -616,15 +727,21 @@ void attn_causal(
             }
         }
         if (fillTails) {
+            if (begin > 0) {
+                std::fill(sc, sc + begin, -1e9f);
+            }
             std::fill(sc + prefix, sc + T, -1e9f);
         }
 
         // ── softmax ───────────────────────────────────────────────────────
         if (pr != sc) {
-            std::memcpy(pr, sc, prefix * sizeof(float));
+            std::memcpy(pr + begin, sc + begin, count * sizeof(float));
         }
-        softmax_inplace(pr, prefix);
+        softmax_inplace(pr + begin, count);
         if (fillTails) {
+            if (begin > 0) {
+                std::fill(pr, pr + begin, 0.0f);
+            }
             std::fill(pr + prefix, pr + T, 0.0f);
         }
 
@@ -632,16 +749,16 @@ void attn_causal(
         float* out = ctx + t * H + h * D;
         if (allActive) {
             if (useD128WeightedSum) {
-                weighted_sum_D128_store(out, v + kv_h * D, pr, prefix, kvDim);
+                weighted_sum_D128_store(out, v + begin * kvDim + kv_h * D, pr + begin, count, kvDim);
             }
             else {
-                for (std::size_t j = 0; j < prefix; ++j) {
+                for (std::size_t j = begin; j < prefix; ++j) {
                     axpy_D(out, v + j * kvDim + kv_h * D, pr[j], D);
                 }
             }
         }
         else {
-            for (std::size_t j = 0; j < prefix; ++j) {
+            for (std::size_t j = begin; j < prefix; ++j) {
                 if (attentionMask[j] == 0) continue;
                 axpy_D(out, v + j * kvDim + kv_h * D, pr[j], D);
             }
@@ -705,8 +822,21 @@ static void attn_causal_backward_impl(
     const float       inv_sqrt_d = 1.0f / std::sqrt(float(D));
     const std::size_t heads_per_group = nHeads / nKvHeads;
     const std::size_t dkvSize = T * kvDim;
-    const bool allActive = !attentionMask ||
-        std::all_of(attentionMask, attentionMask + T, [](int v) { return v != 0; });
+    const bool segmented = attentionMask &&
+        std::any_of(attentionMask, attentionMask + T, [](int v) { return v > 1; });
+    std::vector<std::size_t> segmentStarts;
+    if (segmented) {
+        segmentStarts.resize(T, 0);
+        std::size_t currentStart = 0;
+        for (std::size_t t = 0; t < T; ++t) {
+            if (attentionMask[t] > 1) {
+                currentStart = t;
+            }
+            segmentStarts[t] = currentStart;
+        }
+    }
+    const bool allActive = !segmented && (!attentionMask ||
+        std::all_of(attentionMask, attentionMask + T, [](int v) { return v != 0; }));
     const bool useDqOverwriteD128 = allActive && D == 128 && options.enableDqOverwriteD128;
     const bool useGroupedLocalAccum =
         options.enableGroupedLocalAccum &&
@@ -719,6 +849,16 @@ static void attn_causal_backward_impl(
         heads_per_group == 4 &&
         options.enableGrouped4FusedD128 &&
         T >= kGroupedTileMinT;
+    const bool useGrouped4RowOverwrite =
+        useGrouped4FusedD128 &&
+        options.enableGrouped4RowOverwrite;
+    const bool useGrouped4SplitDqDkvD128 =
+        useGrouped4FusedD128 &&
+        options.enableGrouped4SplitDqDkvD128;
+    const bool usePrecomputeDsD128 =
+        allActive &&
+        D == 128 &&
+        options.enablePrecomputeDsD128;
     const bool useGroupLocalGroupCompare =
         useGroupedLocalAccum &&
         attn_backward_group_local_group_compare_enabled() &&
@@ -752,9 +892,10 @@ static void attn_causal_backward_impl(
             constexpr std::size_t JB = 16;
             float sum = 0.0f;
 
+            const std::size_t begin = segmented ? segmentStarts[t] : 0;
             const std::size_t prefix = t + 1;
             if (allActive) {
-                for (std::size_t j0 = 0; j0 < prefix; j0 += JB) {
+                for (std::size_t j0 = begin; j0 < prefix; j0 += JB) {
                     const std::size_t j1 = std::min(j0 + JB, prefix);
 
                     for (std::size_t j = j0; j < j1; ++j) {
@@ -765,7 +906,7 @@ static void attn_causal_backward_impl(
                 }
             }
             else {
-                for (std::size_t j = 0; j < prefix; ++j) {
+                for (std::size_t j = begin; j < prefix; ++j) {
                     if (attentionMask[j] == 0) continue;
                     const float dp = dot_D(dCt, v + j * kvDim + kv_h * D, D);
                     tmpLocal[j] = dp;
@@ -774,9 +915,15 @@ static void attn_causal_backward_impl(
             }
 
             constexpr float kDSClamp = 10.0f;
+            if (usePrecomputeDsD128) {
+                for (std::size_t j = begin; j < prefix; ++j) {
+                    tmpLocal[j] =
+                        std::max(-kDSClamp, std::min(kDSClamp, pr[j] * (tmpLocal[j] - sum))) * inv_sqrt_d;
+                }
+            }
             if (allActive) {
                 if (D == 128) {
-                    for (std::size_t j0 = 0; j0 < prefix; j0 += JB) {
+                    for (std::size_t j0 = begin; j0 < prefix; j0 += JB) {
                         const std::size_t j1 = std::min(j0 + JB, prefix);
                         const std::size_t tileRows = j1 - j0;
 
@@ -816,8 +963,9 @@ static void attn_causal_backward_impl(
                                 const std::size_t r = j - j0;
 
                                 const float pj = pr[j];
-                                const float dS =
-                                    std::max(-kDSClamp, std::min(kDSClamp, pj * (tmpLocal[j] - sum))) * inv_sqrt_d;
+                                const float dS = usePrecomputeDsD128
+                                    ? tmpLocal[j]
+                                    : std::max(-kDSClamp, std::min(kDSClamp, pj * (tmpLocal[j] - sum))) * inv_sqrt_d;
 
                                 const __m256 pjv = _mm256_set1_ps(pj);
                                 const __m256 aqk = _mm256_set1_ps(dS);
@@ -877,25 +1025,27 @@ static void attn_causal_backward_impl(
                                 float* dKBase = dKSlice + j * kvRowStride + base;
                                 float* dVBase = dVSlice + j * kvRowStride + base;
 
-                                __m256 dk0 = _mm256_loadu_ps(dKBase + 0);
-                                __m256 dk1 = _mm256_loadu_ps(dKBase + 8);
-                                __m256 dk2 = _mm256_loadu_ps(dKBase + 16);
-                                __m256 dk3 = _mm256_loadu_ps(dKBase + 24);
+                                __m256 dk0 = _mm256_load_ps(&dKTile[r][0]);
+                                __m256 dk1 = _mm256_load_ps(&dKTile[r][8]);
+                                __m256 dk2 = _mm256_load_ps(&dKTile[r][16]);
+                                __m256 dk3 = _mm256_load_ps(&dKTile[r][24]);
 
-                                __m256 dv0 = _mm256_loadu_ps(dVBase + 0);
-                                __m256 dv1 = _mm256_loadu_ps(dVBase + 8);
-                                __m256 dv2 = _mm256_loadu_ps(dVBase + 16);
-                                __m256 dv3 = _mm256_loadu_ps(dVBase + 24);
+                                __m256 dv0 = _mm256_load_ps(&dVTile[r][0]);
+                                __m256 dv1 = _mm256_load_ps(&dVTile[r][8]);
+                                __m256 dv2 = _mm256_load_ps(&dVTile[r][16]);
+                                __m256 dv3 = _mm256_load_ps(&dVTile[r][24]);
 
-                                dk0 = _mm256_add_ps(dk0, _mm256_load_ps(&dKTile[r][0]));
-                                dk1 = _mm256_add_ps(dk1, _mm256_load_ps(&dKTile[r][8]));
-                                dk2 = _mm256_add_ps(dk2, _mm256_load_ps(&dKTile[r][16]));
-                                dk3 = _mm256_add_ps(dk3, _mm256_load_ps(&dKTile[r][24]));
+                                if (!(kvRowStartsZero && t == j)) {
+                                    dk0 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 0), dk0);
+                                    dk1 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 8), dk1);
+                                    dk2 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 16), dk2);
+                                    dk3 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 24), dk3);
 
-                                dv0 = _mm256_add_ps(dv0, _mm256_load_ps(&dVTile[r][0]));
-                                dv1 = _mm256_add_ps(dv1, _mm256_load_ps(&dVTile[r][8]));
-                                dv2 = _mm256_add_ps(dv2, _mm256_load_ps(&dVTile[r][16]));
-                                dv3 = _mm256_add_ps(dv3, _mm256_load_ps(&dVTile[r][24]));
+                                    dv0 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 0), dv0);
+                                    dv1 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 8), dv1);
+                                    dv2 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 16), dv2);
+                                    dv3 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 24), dv3);
+                                }
 
                                 _mm256_storeu_ps(dKBase + 0, dk0);
                                 _mm256_storeu_ps(dKBase + 8, dk1);
@@ -911,7 +1061,7 @@ static void attn_causal_backward_impl(
                     }
                 }
                 else {
-                    for (std::size_t j = 0; j < prefix; ++j) {
+                    for (std::size_t j = begin; j < prefix; ++j) {
                         const float pj = pr[j];
                         const float dS_raw = pj * (tmpLocal[j] - sum);
                         const float dS = std::max(-kDSClamp, std::min(kDSClamp, dS_raw));
@@ -923,7 +1073,7 @@ static void attn_causal_backward_impl(
                 }
             }
             else {
-                for (std::size_t j = 0; j < prefix; ++j) {
+                for (std::size_t j = begin; j < prefix; ++j) {
                     if (attentionMask[j] == 0) continue;
 
                     const float pj = pr[j];
@@ -1004,6 +1154,253 @@ static void attn_causal_backward_impl(
                     sum3 += pr3[j] * dp3;
                 }
 
+                if (usePrecomputeDsD128) {
+                    for (std::size_t j = 0; j < prefix; ++j) {
+                        tmp0[j] = std::max(-kDSClamp, std::min(kDSClamp, pr0[j] * (tmp0[j] - sum0))) * inv_sqrt_d;
+                        tmp1[j] = std::max(-kDSClamp, std::min(kDSClamp, pr1[j] * (tmp1[j] - sum1))) * inv_sqrt_d;
+                        tmp2[j] = std::max(-kDSClamp, std::min(kDSClamp, pr2[j] * (tmp2[j] - sum2))) * inv_sqrt_d;
+                        tmp3[j] = std::max(-kDSClamp, std::min(kDSClamp, pr3[j] * (tmp3[j] - sum3))) * inv_sqrt_d;
+                    }
+                }
+
+                if (useGrouped4SplitDqDkvD128) {
+                    if (!usePrecomputeDsD128) {
+                        for (std::size_t j = 0; j < prefix; ++j) {
+                            tmp0[j] = std::max(-kDSClamp, std::min(kDSClamp, pr0[j] * (tmp0[j] - sum0))) * inv_sqrt_d;
+                            tmp1[j] = std::max(-kDSClamp, std::min(kDSClamp, pr1[j] * (tmp1[j] - sum1))) * inv_sqrt_d;
+                            tmp2[j] = std::max(-kDSClamp, std::min(kDSClamp, pr2[j] * (tmp2[j] - sum2))) * inv_sqrt_d;
+                            tmp3[j] = std::max(-kDSClamp, std::min(kDSClamp, pr3[j] * (tmp3[j] - sum3))) * inv_sqrt_d;
+                        }
+                    }
+
+                    // Pass 2a: dQ only. Keeping the four dQ rows resident avoids
+                    // carrying q/dCtx state at the same time and removes per-tile
+                    // dQ reload/store traffic from the fused path.
+                    for (std::size_t base = 0; base < D; base += 32) {
+                        float* dQBase0 = dQt0 + base;
+                        float* dQBase1 = dQt1 + base;
+                        float* dQBase2 = dQt2 + base;
+                        float* dQBase3 = dQt3 + base;
+
+                        __m256 dq00 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 0);
+                        __m256 dq01 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 8);
+                        __m256 dq02 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 16);
+                        __m256 dq03 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 24);
+
+                        __m256 dq10 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 0);
+                        __m256 dq11 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 8);
+                        __m256 dq12 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 16);
+                        __m256 dq13 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 24);
+
+                        __m256 dq20 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 0);
+                        __m256 dq21 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 8);
+                        __m256 dq22 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 16);
+                        __m256 dq23 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 24);
+
+                        __m256 dq30 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 0);
+                        __m256 dq31 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 8);
+                        __m256 dq32 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 16);
+                        __m256 dq33 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 24);
+
+                        for (std::size_t j = 0; j < prefix; ++j) {
+                            const __m256 aqk0 = _mm256_set1_ps(tmp0[j]);
+                            const __m256 aqk1 = _mm256_set1_ps(tmp1[j]);
+                            const __m256 aqk2 = _mm256_set1_ps(tmp2[j]);
+                            const __m256 aqk3 = _mm256_set1_ps(tmp3[j]);
+
+                            const float* kBase = k + j * kvDim + kvOffset + base;
+                            const __m256 k0 = _mm256_loadu_ps(kBase + 0);
+                            const __m256 k1 = _mm256_loadu_ps(kBase + 8);
+                            const __m256 k2 = _mm256_loadu_ps(kBase + 16);
+                            const __m256 k3 = _mm256_loadu_ps(kBase + 24);
+
+                            dq00 = _mm256_fmadd_ps(aqk0, k0, dq00);
+                            dq01 = _mm256_fmadd_ps(aqk0, k1, dq01);
+                            dq02 = _mm256_fmadd_ps(aqk0, k2, dq02);
+                            dq03 = _mm256_fmadd_ps(aqk0, k3, dq03);
+
+                            dq10 = _mm256_fmadd_ps(aqk1, k0, dq10);
+                            dq11 = _mm256_fmadd_ps(aqk1, k1, dq11);
+                            dq12 = _mm256_fmadd_ps(aqk1, k2, dq12);
+                            dq13 = _mm256_fmadd_ps(aqk1, k3, dq13);
+
+                            dq20 = _mm256_fmadd_ps(aqk2, k0, dq20);
+                            dq21 = _mm256_fmadd_ps(aqk2, k1, dq21);
+                            dq22 = _mm256_fmadd_ps(aqk2, k2, dq22);
+                            dq23 = _mm256_fmadd_ps(aqk2, k3, dq23);
+
+                            dq30 = _mm256_fmadd_ps(aqk3, k0, dq30);
+                            dq31 = _mm256_fmadd_ps(aqk3, k1, dq31);
+                            dq32 = _mm256_fmadd_ps(aqk3, k2, dq32);
+                            dq33 = _mm256_fmadd_ps(aqk3, k3, dq33);
+                        }
+
+                        _mm256_storeu_ps(dQBase0 + 0, dq00);
+                        _mm256_storeu_ps(dQBase0 + 8, dq01);
+                        _mm256_storeu_ps(dQBase0 + 16, dq02);
+                        _mm256_storeu_ps(dQBase0 + 24, dq03);
+                        _mm256_storeu_ps(dQBase1 + 0, dq10);
+                        _mm256_storeu_ps(dQBase1 + 8, dq11);
+                        _mm256_storeu_ps(dQBase1 + 16, dq12);
+                        _mm256_storeu_ps(dQBase1 + 24, dq13);
+                        _mm256_storeu_ps(dQBase2 + 0, dq20);
+                        _mm256_storeu_ps(dQBase2 + 8, dq21);
+                        _mm256_storeu_ps(dQBase2 + 16, dq22);
+                        _mm256_storeu_ps(dQBase2 + 24, dq23);
+                        _mm256_storeu_ps(dQBase3 + 0, dq30);
+                        _mm256_storeu_ps(dQBase3 + 8, dq31);
+                        _mm256_storeu_ps(dQBase3 + 16, dq32);
+                        _mm256_storeu_ps(dQBase3 + 24, dq33);
+                    }
+
+                    // Pass 2b: dK/dV only. This keeps only q and dCtx live.
+                    for (std::size_t j0 = 0; j0 < prefix; j0 += JB) {
+                        const std::size_t j1 = std::min(j0 + JB, prefix);
+                        const std::size_t tileRows = j1 - j0;
+
+                        for (std::size_t base = 0; base < D; base += 32) {
+                            alignas(32) float dKTile[JB][32];
+                            alignas(32) float dVTile[JB][32];
+                            for (std::size_t r = 0; r < tileRows; ++r) {
+                                for (std::size_t x = 0; x < 32; ++x) {
+                                    dKTile[r][x] = 0.0f;
+                                    dVTile[r][x] = 0.0f;
+                                }
+                            }
+
+                            const __m256 q00 = _mm256_loadu_ps(Qt0 + base + 0);
+                            const __m256 q01 = _mm256_loadu_ps(Qt0 + base + 8);
+                            const __m256 q02 = _mm256_loadu_ps(Qt0 + base + 16);
+                            const __m256 q03 = _mm256_loadu_ps(Qt0 + base + 24);
+                            const __m256 q10 = _mm256_loadu_ps(Qt1 + base + 0);
+                            const __m256 q11 = _mm256_loadu_ps(Qt1 + base + 8);
+                            const __m256 q12 = _mm256_loadu_ps(Qt1 + base + 16);
+                            const __m256 q13 = _mm256_loadu_ps(Qt1 + base + 24);
+                            const __m256 q20 = _mm256_loadu_ps(Qt2 + base + 0);
+                            const __m256 q21 = _mm256_loadu_ps(Qt2 + base + 8);
+                            const __m256 q22 = _mm256_loadu_ps(Qt2 + base + 16);
+                            const __m256 q23 = _mm256_loadu_ps(Qt2 + base + 24);
+                            const __m256 q30 = _mm256_loadu_ps(Qt3 + base + 0);
+                            const __m256 q31 = _mm256_loadu_ps(Qt3 + base + 8);
+                            const __m256 q32 = _mm256_loadu_ps(Qt3 + base + 16);
+                            const __m256 q33 = _mm256_loadu_ps(Qt3 + base + 24);
+
+                            const __m256 dc00 = _mm256_loadu_ps(dCt0 + base + 0);
+                            const __m256 dc01 = _mm256_loadu_ps(dCt0 + base + 8);
+                            const __m256 dc02 = _mm256_loadu_ps(dCt0 + base + 16);
+                            const __m256 dc03 = _mm256_loadu_ps(dCt0 + base + 24);
+                            const __m256 dc10 = _mm256_loadu_ps(dCt1 + base + 0);
+                            const __m256 dc11 = _mm256_loadu_ps(dCt1 + base + 8);
+                            const __m256 dc12 = _mm256_loadu_ps(dCt1 + base + 16);
+                            const __m256 dc13 = _mm256_loadu_ps(dCt1 + base + 24);
+                            const __m256 dc20 = _mm256_loadu_ps(dCt2 + base + 0);
+                            const __m256 dc21 = _mm256_loadu_ps(dCt2 + base + 8);
+                            const __m256 dc22 = _mm256_loadu_ps(dCt2 + base + 16);
+                            const __m256 dc23 = _mm256_loadu_ps(dCt2 + base + 24);
+                            const __m256 dc30 = _mm256_loadu_ps(dCt3 + base + 0);
+                            const __m256 dc31 = _mm256_loadu_ps(dCt3 + base + 8);
+                            const __m256 dc32 = _mm256_loadu_ps(dCt3 + base + 16);
+                            const __m256 dc33 = _mm256_loadu_ps(dCt3 + base + 24);
+
+                            for (std::size_t j = j0; j < j1; ++j) {
+                                const std::size_t r = j - j0;
+                                const __m256 pjv0 = _mm256_set1_ps(pr0[j]);
+                                const __m256 pjv1 = _mm256_set1_ps(pr1[j]);
+                                const __m256 pjv2 = _mm256_set1_ps(pr2[j]);
+                                const __m256 pjv3 = _mm256_set1_ps(pr3[j]);
+                                const __m256 aqk0 = _mm256_set1_ps(tmp0[j]);
+                                const __m256 aqk1 = _mm256_set1_ps(tmp1[j]);
+                                const __m256 aqk2 = _mm256_set1_ps(tmp2[j]);
+                                const __m256 aqk3 = _mm256_set1_ps(tmp3[j]);
+
+                                __m256 tv0 = _mm256_load_ps(&dVTile[r][0]);
+                                __m256 tv1 = _mm256_load_ps(&dVTile[r][8]);
+                                __m256 tv2 = _mm256_load_ps(&dVTile[r][16]);
+                                __m256 tv3 = _mm256_load_ps(&dVTile[r][24]);
+                                tv0 = _mm256_fmadd_ps(pjv0, dc00, tv0);
+                                tv1 = _mm256_fmadd_ps(pjv0, dc01, tv1);
+                                tv2 = _mm256_fmadd_ps(pjv0, dc02, tv2);
+                                tv3 = _mm256_fmadd_ps(pjv0, dc03, tv3);
+                                tv0 = _mm256_fmadd_ps(pjv1, dc10, tv0);
+                                tv1 = _mm256_fmadd_ps(pjv1, dc11, tv1);
+                                tv2 = _mm256_fmadd_ps(pjv1, dc12, tv2);
+                                tv3 = _mm256_fmadd_ps(pjv1, dc13, tv3);
+                                tv0 = _mm256_fmadd_ps(pjv2, dc20, tv0);
+                                tv1 = _mm256_fmadd_ps(pjv2, dc21, tv1);
+                                tv2 = _mm256_fmadd_ps(pjv2, dc22, tv2);
+                                tv3 = _mm256_fmadd_ps(pjv2, dc23, tv3);
+                                tv0 = _mm256_fmadd_ps(pjv3, dc30, tv0);
+                                tv1 = _mm256_fmadd_ps(pjv3, dc31, tv1);
+                                tv2 = _mm256_fmadd_ps(pjv3, dc32, tv2);
+                                tv3 = _mm256_fmadd_ps(pjv3, dc33, tv3);
+                                _mm256_store_ps(&dVTile[r][0], tv0);
+                                _mm256_store_ps(&dVTile[r][8], tv1);
+                                _mm256_store_ps(&dVTile[r][16], tv2);
+                                _mm256_store_ps(&dVTile[r][24], tv3);
+
+                                __m256 tk0 = _mm256_load_ps(&dKTile[r][0]);
+                                __m256 tk1 = _mm256_load_ps(&dKTile[r][8]);
+                                __m256 tk2 = _mm256_load_ps(&dKTile[r][16]);
+                                __m256 tk3 = _mm256_load_ps(&dKTile[r][24]);
+                                tk0 = _mm256_fmadd_ps(aqk0, q00, tk0);
+                                tk1 = _mm256_fmadd_ps(aqk0, q01, tk1);
+                                tk2 = _mm256_fmadd_ps(aqk0, q02, tk2);
+                                tk3 = _mm256_fmadd_ps(aqk0, q03, tk3);
+                                tk0 = _mm256_fmadd_ps(aqk1, q10, tk0);
+                                tk1 = _mm256_fmadd_ps(aqk1, q11, tk1);
+                                tk2 = _mm256_fmadd_ps(aqk1, q12, tk2);
+                                tk3 = _mm256_fmadd_ps(aqk1, q13, tk3);
+                                tk0 = _mm256_fmadd_ps(aqk2, q20, tk0);
+                                tk1 = _mm256_fmadd_ps(aqk2, q21, tk1);
+                                tk2 = _mm256_fmadd_ps(aqk2, q22, tk2);
+                                tk3 = _mm256_fmadd_ps(aqk2, q23, tk3);
+                                tk0 = _mm256_fmadd_ps(aqk3, q30, tk0);
+                                tk1 = _mm256_fmadd_ps(aqk3, q31, tk1);
+                                tk2 = _mm256_fmadd_ps(aqk3, q32, tk2);
+                                tk3 = _mm256_fmadd_ps(aqk3, q33, tk3);
+                                _mm256_store_ps(&dKTile[r][0], tk0);
+                                _mm256_store_ps(&dKTile[r][8], tk1);
+                                _mm256_store_ps(&dKTile[r][16], tk2);
+                                _mm256_store_ps(&dKTile[r][24], tk3);
+                            }
+
+                            for (std::size_t j = j0; j < j1; ++j) {
+                                const std::size_t r = j - j0;
+                                const std::size_t rowOffset = j * D + base;
+                                float* dKBase = dKLocal + rowOffset;
+                                float* dVBase = dVLocal + rowOffset;
+                                __m256 dk0 = _mm256_load_ps(&dKTile[r][0]);
+                                __m256 dk1 = _mm256_load_ps(&dKTile[r][8]);
+                                __m256 dk2 = _mm256_load_ps(&dKTile[r][16]);
+                                __m256 dk3 = _mm256_load_ps(&dKTile[r][24]);
+                                __m256 dv0 = _mm256_load_ps(&dVTile[r][0]);
+                                __m256 dv1 = _mm256_load_ps(&dVTile[r][8]);
+                                __m256 dv2 = _mm256_load_ps(&dVTile[r][16]);
+                                __m256 dv3 = _mm256_load_ps(&dVTile[r][24]);
+                                if (!(useGrouped4RowOverwrite && t == j)) {
+                                    dk0 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 0), dk0);
+                                    dk1 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 8), dk1);
+                                    dk2 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 16), dk2);
+                                    dk3 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 24), dk3);
+                                    dv0 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 0), dv0);
+                                    dv1 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 8), dv1);
+                                    dv2 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 16), dv2);
+                                    dv3 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 24), dv3);
+                                }
+                                _mm256_storeu_ps(dKBase + 0, dk0);
+                                _mm256_storeu_ps(dKBase + 8, dk1);
+                                _mm256_storeu_ps(dKBase + 16, dk2);
+                                _mm256_storeu_ps(dKBase + 24, dk3);
+                                _mm256_storeu_ps(dVBase + 0, dv0);
+                                _mm256_storeu_ps(dVBase + 8, dv1);
+                                _mm256_storeu_ps(dVBase + 16, dv2);
+                                _mm256_storeu_ps(dVBase + 24, dv3);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // --------------------------------------------------
                 // Pass 2: tiled consume using tmp0..tmp3
                 // --------------------------------------------------
@@ -1077,25 +1474,29 @@ static void attn_causal_backward_impl(
                         const __m256 dc32 = _mm256_loadu_ps(dCtBase3 + 16);
                         const __m256 dc33 = _mm256_loadu_ps(dCtBase3 + 24);
 
-                        __m256 dq00 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 0);
-                        __m256 dq01 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 8);
-                        __m256 dq02 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 16);
-                        __m256 dq03 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 24);
+                        // dQ is accumulated across j-tiles for the same query row. The
+                        // overwrite fast path is valid only for the first tile; later
+                        // tiles must reload the partial dQ produced by earlier tiles.
+                        const bool overwriteDqTile = useDqOverwriteD128 && j0 == 0;
+                        __m256 dq00 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 0);
+                        __m256 dq01 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 8);
+                        __m256 dq02 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 16);
+                        __m256 dq03 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase0 + 24);
 
-                        __m256 dq10 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 0);
-                        __m256 dq11 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 8);
-                        __m256 dq12 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 16);
-                        __m256 dq13 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 24);
+                        __m256 dq10 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 0);
+                        __m256 dq11 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 8);
+                        __m256 dq12 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 16);
+                        __m256 dq13 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase1 + 24);
 
-                        __m256 dq20 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 0);
-                        __m256 dq21 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 8);
-                        __m256 dq22 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 16);
-                        __m256 dq23 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 24);
+                        __m256 dq20 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 0);
+                        __m256 dq21 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 8);
+                        __m256 dq22 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 16);
+                        __m256 dq23 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase2 + 24);
 
-                        __m256 dq30 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 0);
-                        __m256 dq31 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 8);
-                        __m256 dq32 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 16);
-                        __m256 dq33 = useDqOverwriteD128 ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 24);
+                        __m256 dq30 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 0);
+                        __m256 dq31 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 8);
+                        __m256 dq32 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 16);
+                        __m256 dq33 = overwriteDqTile ? _mm256_setzero_ps() : _mm256_loadu_ps(dQBase3 + 24);
 
                         for (std::size_t j = j0; j < j1; ++j) {
                             const std::size_t r = j - j0;
@@ -1105,14 +1506,18 @@ static void attn_causal_backward_impl(
                             const float pj2 = pr2[j];
                             const float pj3 = pr3[j];
 
-                            const float dS0 =
-                                std::max(-kDSClamp, std::min(kDSClamp, pj0 * (tmp0[j] - sum0))) * inv_sqrt_d;
-                            const float dS1 =
-                                std::max(-kDSClamp, std::min(kDSClamp, pj1 * (tmp1[j] - sum1))) * inv_sqrt_d;
-                            const float dS2 =
-                                std::max(-kDSClamp, std::min(kDSClamp, pj2 * (tmp2[j] - sum2))) * inv_sqrt_d;
-                            const float dS3 =
-                                std::max(-kDSClamp, std::min(kDSClamp, pj3 * (tmp3[j] - sum3))) * inv_sqrt_d;
+                            const float dS0 = usePrecomputeDsD128
+                                ? tmp0[j]
+                                : std::max(-kDSClamp, std::min(kDSClamp, pj0 * (tmp0[j] - sum0))) * inv_sqrt_d;
+                            const float dS1 = usePrecomputeDsD128
+                                ? tmp1[j]
+                                : std::max(-kDSClamp, std::min(kDSClamp, pj1 * (tmp1[j] - sum1))) * inv_sqrt_d;
+                            const float dS2 = usePrecomputeDsD128
+                                ? tmp2[j]
+                                : std::max(-kDSClamp, std::min(kDSClamp, pj2 * (tmp2[j] - sum2))) * inv_sqrt_d;
+                            const float dS3 = usePrecomputeDsD128
+                                ? tmp3[j]
+                                : std::max(-kDSClamp, std::min(kDSClamp, pj3 * (tmp3[j] - sum3))) * inv_sqrt_d;
 
                             const __m256 pjv0 = _mm256_set1_ps(pj0);
                             const __m256 pjv1 = _mm256_set1_ps(pj1);
@@ -1239,25 +1644,30 @@ static void attn_causal_backward_impl(
                             float* dKBase = dKLocal + rowOffset;
                             float* dVBase = dVLocal + rowOffset;
 
-                            __m256 dk0 = _mm256_loadu_ps(dKBase + 0);
-                            __m256 dk1 = _mm256_loadu_ps(dKBase + 8);
-                            __m256 dk2 = _mm256_loadu_ps(dKBase + 16);
-                            __m256 dk3 = _mm256_loadu_ps(dKBase + 24);
+                            __m256 dk0 = _mm256_load_ps(&dKTile[r][0]);
+                            __m256 dk1 = _mm256_load_ps(&dKTile[r][8]);
+                            __m256 dk2 = _mm256_load_ps(&dKTile[r][16]);
+                            __m256 dk3 = _mm256_load_ps(&dKTile[r][24]);
 
-                            __m256 dv0 = _mm256_loadu_ps(dVBase + 0);
-                            __m256 dv1 = _mm256_loadu_ps(dVBase + 8);
-                            __m256 dv2 = _mm256_loadu_ps(dVBase + 16);
-                            __m256 dv3 = _mm256_loadu_ps(dVBase + 24);
+                            __m256 dv0 = _mm256_load_ps(&dVTile[r][0]);
+                            __m256 dv1 = _mm256_load_ps(&dVTile[r][8]);
+                            __m256 dv2 = _mm256_load_ps(&dVTile[r][16]);
+                            __m256 dv3 = _mm256_load_ps(&dVTile[r][24]);
 
-                            dk0 = _mm256_add_ps(dk0, _mm256_load_ps(&dKTile[r][0]));
-                            dk1 = _mm256_add_ps(dk1, _mm256_load_ps(&dKTile[r][8]));
-                            dk2 = _mm256_add_ps(dk2, _mm256_load_ps(&dKTile[r][16]));
-                            dk3 = _mm256_add_ps(dk3, _mm256_load_ps(&dKTile[r][24]));
+                            // Row j is first touched at query t == j in causal
+                            // attention, so the first contribution can overwrite
+                            // stale local scratch instead of paying a full clear.
+                            if (!(useGrouped4RowOverwrite && t == j)) {
+                                dk0 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 0), dk0);
+                                dk1 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 8), dk1);
+                                dk2 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 16), dk2);
+                                dk3 = _mm256_add_ps(_mm256_loadu_ps(dKBase + 24), dk3);
 
-                            dv0 = _mm256_add_ps(dv0, _mm256_load_ps(&dVTile[r][0]));
-                            dv1 = _mm256_add_ps(dv1, _mm256_load_ps(&dVTile[r][8]));
-                            dv2 = _mm256_add_ps(dv2, _mm256_load_ps(&dVTile[r][16]));
-                            dv3 = _mm256_add_ps(dv3, _mm256_load_ps(&dVTile[r][24]));
+                                dv0 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 0), dv0);
+                                dv1 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 8), dv1);
+                                dv2 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 16), dv2);
+                                dv3 = _mm256_add_ps(_mm256_loadu_ps(dVBase + 24), dv3);
+                            }
 
                             _mm256_storeu_ps(dKBase + 0, dk0);
                             _mm256_storeu_ps(dKBase + 8, dk1);
@@ -1336,7 +1746,14 @@ static void attn_causal_backward_impl(
             const std::size_t headBegin = kv_h * heads_per_group;
             const std::size_t headEnd = headBegin + heads_per_group;
             if (useGroupedLocalAccum) {
-                const bool useRowOverwriteInit = false;
+                const bool useRowOverwriteInit =
+                    allActive &&
+                    D == 128 &&
+                    !useGrouped4FusedD128 &&
+                    options.enableGroupedLocalRowOverwrite;
+                const bool useGroup4RowOverwriteInit =
+                    useGrouped4RowOverwrite &&
+                    !useGroupLocalHeadCompare;
                 std::vector<float> dKGroupRef;
                 std::vector<float> dVGroupRef;
                 std::vector<float> dQGroupSnapshot;
@@ -1344,6 +1761,10 @@ static void attn_causal_backward_impl(
                 std::vector<float> dVGroupHeadRef;
                 std::vector<float> dQHeadSnapshot;
                 std::vector<float> dQHeadRepeatSnapshot;
+                std::vector<float> dKHeadLocalBefore;
+                std::vector<float> dVHeadLocalBefore;
+                std::vector<float> dKHeadLocalDelta;
+                std::vector<float> dVHeadLocalDelta;
                 std::vector<float> tmpLocalRef;
                 if (useGroupLocalGroupCompare) {
                     dKGroupRef.assign(T * kvDim, 0.0f);
@@ -1381,9 +1802,13 @@ static void attn_causal_backward_impl(
                     dVGroupHeadRef.assign(T * D, 0.0f);
                     dQHeadSnapshot.resize(T * D);
                     dQHeadRepeatSnapshot.resize(T * D);
+                    dKHeadLocalBefore.resize(T * D);
+                    dVHeadLocalBefore.resize(T * D);
+                    dKHeadLocalDelta.resize(T * D);
+                    dVHeadLocalDelta.resize(T * D);
                     tmpLocalRef.resize(T);
                 }
-                if (!useRowOverwriteInit) {
+                if (!useRowOverwriteInit && !useGroup4RowOverwriteInit) {
                     dKGroupLocal.assign(T * D, 0.0f);
                     dVGroupLocal.assign(T * D, 0.0f);
                 }
@@ -1413,6 +1838,8 @@ static void attn_causal_backward_impl(
                     bool firstHead = true;
                     for (std::size_t head = headBegin; head < headEnd; ++head) {
                         if (useGroupLocalHeadCompare) {
+                            std::fill(dKGroupHeadRef.begin(), dKGroupHeadRef.end(), 0.0f);
+                            std::fill(dVGroupHeadRef.begin(), dVGroupHeadRef.end(), 0.0f);
                             for (std::size_t t = 0; t < T; ++t) {
                                 std::memcpy(
                                     dQHeadSnapshot.data() + t * D,
@@ -1489,6 +1916,11 @@ static void attn_causal_backward_impl(
                             }
                         }
 
+                        if (useGroupLocalHeadCompare) {
+                            std::copy(dKGroupLocal.begin(), dKGroupLocal.end(), dKHeadLocalBefore.begin());
+                            std::copy(dVGroupLocal.begin(), dVGroupLocal.end(), dVHeadLocalBefore.begin());
+                        }
+
                         backward_one_head(
                             head,
                             dKGroupLocal.data(),
@@ -1506,8 +1938,19 @@ static void attn_causal_backward_impl(
                                 kv_h,
                                 head,
                                 head - headBegin);
-                            report_backward_diff("head_dK", dKGroupHeadRef.data(), dKGroupLocal.data(), T * D);
-                            report_backward_diff("head_dV", dVGroupHeadRef.data(), dVGroupLocal.data(), T * D);
+                            const bool compareWholeLocal = useRowOverwriteInit && firstHead;
+                            if (compareWholeLocal) {
+                                report_backward_diff("head_dK", dKGroupHeadRef.data(), dKGroupLocal.data(), T * D);
+                                report_backward_diff("head_dV", dVGroupHeadRef.data(), dVGroupLocal.data(), T * D);
+                            }
+                            else {
+                                for (std::size_t i = 0; i < T * D; ++i) {
+                                    dKHeadLocalDelta[i] = dKGroupLocal[i] - dKHeadLocalBefore[i];
+                                    dVHeadLocalDelta[i] = dVGroupLocal[i] - dVHeadLocalBefore[i];
+                                }
+                                report_backward_diff("head_dK", dKGroupHeadRef.data(), dKHeadLocalDelta.data(), T * D);
+                                report_backward_diff("head_dV", dVGroupHeadRef.data(), dVHeadLocalDelta.data(), T * D);
+                            }
                         }
                         firstHead = false;
                     }
@@ -1599,10 +2042,7 @@ void attn_causal_backward(
     }
     compareConsumed = true;
 
-    AttnBackwardOptions baselineOptions = defaultOptions;
-    baselineOptions.enableGroupedLocalAccum = false;
-    baselineOptions.enableGroupedLocalRowOverwrite = false;
-    baselineOptions.enableGrouped4FusedD128 = false;
+    AttnBackwardOptions baselineOptions = baseline_attn_backward_options();
 
     AttnBackwardOptions candidateOptions = defaultOptions;
     apply_debug_candidate_overrides(candidateOptions);
@@ -1638,10 +2078,13 @@ void attn_causal_backward(
 
     std::fprintf(
         stderr,
-        "[ATTN_BWD_COMPARE] candidate={group_local=%d,row_overwrite=%d,group4_fused=%d,dq_overwrite=%d,head_parallel=%d} baseline={group_local=%d}\n",
+        "[ATTN_BWD_COMPARE] candidate={group_local=%d,row_overwrite=%d,group4_fused=%d,group4_row_overwrite=%d,precompute_ds=%d,group4_split=%d,dq_overwrite=%d,head_parallel=%d} baseline={group_local=%d}\n",
         candidateOptions.enableGroupedLocalAccum ? 1 : 0,
         candidateOptions.enableGroupedLocalRowOverwrite ? 1 : 0,
         candidateOptions.enableGrouped4FusedD128 ? 1 : 0,
+        candidateOptions.enableGrouped4RowOverwrite ? 1 : 0,
+        candidateOptions.enablePrecomputeDsD128 ? 1 : 0,
+        candidateOptions.enableGrouped4SplitDqDkvD128 ? 1 : 0,
         candidateOptions.enableDqOverwriteD128 ? 1 : 0,
         candidateOptions.enableHeadParallel ? 1 : 0,
         baselineOptions.enableGroupedLocalAccum ? 1 : 0);

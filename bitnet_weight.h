@@ -14,6 +14,11 @@ struct BitNetMat {
     std::vector<float> s;      // per-block scales
 };
 
+enum class BitNetI2SScaleLayout : std::uint32_t {
+    JMajorContiguousRows = 1, // [jBlock][kBlock]
+    JMajorBroadcastRows = 2,  // [jBlock][kBlock][8]
+};
+
 // ------------------------------------------------------------
 // Packed 2-bit BitNet I2S container (Option B / x4 Arch)
 //
@@ -27,16 +32,22 @@ struct BitNetMatI2S {
     // Forward quantization / kernel layout
     std::size_t qk = 128;  // block size along rows (input dim)
     std::size_t jq = 32;   // block size along cols (output dim)
+    BitNetI2SScaleLayout scaleLayout = BitNetI2SScaleLayout::JMajorBroadcastRows;
 
     // Packed 2-bit weights
     std::vector<uint8_t> q2;           // W packed row-major
     std::vector<uint8_t> q2T;          // W^T packed row-major
+    std::vector<int8_t> q8;            // Optional decoded W cache for hot forward kernels
+    std::vector<int8_t> qT8;           // Optional decoded W^T cache for hot backward kernels
 
     // Tiled scales
     std::vector<float> w_scale_tile;   // size = nKBlocks * nJBlocks
     std::vector<float> w_scale_tileT;  // transposed for backward
+    std::vector<float> w_scale_tile_broadcast8;   // size = nKBlocks * nJBlocks * 8
+    std::vector<float> w_scale_tileT_broadcast8;  // transposed for backward, broadcast-friendly
 
     static constexpr std::size_t weightsPerByte = 4;
+    static constexpr std::size_t scaleBroadcastWidth = 8;
 
     bool empty() const noexcept {
         return rows == 0 || cols == 0 || q2.empty() || w_scale_tile.empty();
@@ -60,17 +71,59 @@ struct BitNetMatI2S {
         return nKBlocks() * nJBlocks();
     }
 
+    std::size_t expectedBroadcastScaleCount() const noexcept {
+        return expectedScaleCount() * scaleBroadcastWidth;
+    }
+
+    bool hasSupportedScaleLayout() const noexcept {
+        return scaleLayout == BitNetI2SScaleLayout::JMajorContiguousRows
+            || scaleLayout == BitNetI2SScaleLayout::JMajorBroadcastRows;
+    }
+
+    std::size_t forwardScaleIndex(std::size_t jBlock, std::size_t kBlock) const noexcept {
+        return jBlock * nKBlocks() + kBlock;
+    }
+
+    std::size_t backwardScaleIndex(std::size_t kBlock, std::size_t jBlock) const noexcept {
+        return kBlock * nJBlocks() + jBlock;
+    }
+
+    const float* forwardScaleBroadcastRow(std::size_t jBlock) const noexcept {
+        return w_scale_tile_broadcast8.data()
+            + forwardScaleIndex(jBlock, 0) * scaleBroadcastWidth;
+    }
+
+    float* forwardScaleBroadcastRow(std::size_t jBlock) noexcept {
+        return w_scale_tile_broadcast8.data()
+            + forwardScaleIndex(jBlock, 0) * scaleBroadcastWidth;
+    }
+
+    const float* backwardScaleBroadcastRow(std::size_t kBlock) const noexcept {
+        return w_scale_tileT_broadcast8.data()
+            + backwardScaleIndex(kBlock, 0) * scaleBroadcastWidth;
+    }
+
+    float* backwardScaleBroadcastRow(std::size_t kBlock) noexcept {
+        return w_scale_tileT_broadcast8.data()
+            + backwardScaleIndex(kBlock, 0) * scaleBroadcastWidth;
+    }
+
     bool validForShape() const noexcept {
         return rows != 0 && cols != 0 && qk != 0 && jq != 0
+            && hasSupportedScaleLayout()
             && q2.size() >= expectedPackedBytes()
             && q2T.size() >= expectedPackedBytes()
             && w_scale_tile.size() >= expectedScaleCount()
-            && w_scale_tileT.size() >= expectedScaleCount();
+            && w_scale_tileT.size() >= expectedScaleCount()
+            && w_scale_tile_broadcast8.size() >= expectedBroadcastScaleCount()
+            && w_scale_tileT_broadcast8.size() >= expectedBroadcastScaleCount();
     }
 
     void clear() noexcept {
         rows = 0; cols = 0; hadamard32 = false; qk = 128; jq = 32;
-        q2.clear(); q2T.clear(); w_scale_tile.clear(); w_scale_tileT.clear();
+        scaleLayout = BitNetI2SScaleLayout::JMajorBroadcastRows;
+        q2.clear(); q2T.clear(); q8.clear(); qT8.clear(); w_scale_tile.clear(); w_scale_tileT.clear();
+        w_scale_tile_broadcast8.clear(); w_scale_tileT_broadcast8.clear();
     }
 };
 
@@ -195,3 +248,6 @@ struct BitNetMatTL2Gen {
 };
 
 void build_bitnet_i2s_transposed_view(BitNetMatI2S& W);
+void build_bitnet_i2s_decoded_forward_cache(BitNetMatI2S& W);
+void build_bitnet_i2s_decoded_transposed_cache(BitNetMatI2S& W);
+void rebuild_bitnet_i2s_scale_broadcast_views(BitNetMatI2S& W);

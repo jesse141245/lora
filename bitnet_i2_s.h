@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "bitnet_transform.h"
@@ -65,10 +66,65 @@ inline bool try_get_env_float(const char* name, float& out) {
     return true;
 }
 
+inline bool activation_avx2_quant_enabled() {
+    static const bool cached = []() {
+#if defined(_WIN32)
+        char* buffer = nullptr;
+        std::size_t len = 0;
+        if (_dupenv_s(&buffer, &len, "QLORA_TEST_BITNET_AVX2_ACT_QUANT") != 0 || !buffer || len == 0 || buffer[0] == '\0') {
+            if (buffer) std::free(buffer);
+            return false;
+        }
+        const std::string value(buffer);
+        std::free(buffer);
+        return !(value == "0" ||
+            value == "false" ||
+            value == "False" ||
+            value == "off" ||
+            value == "Off");
+#else
+        const char* value = std::getenv("QLORA_TEST_BITNET_AVX2_ACT_QUANT");
+        if (!value || *value == '\0') {
+            return false;
+        }
+        return !(std::strcmp(value, "0") == 0 ||
+            std::strcmp(value, "false") == 0 ||
+            std::strcmp(value, "False") == 0 ||
+            std::strcmp(value, "off") == 0 ||
+            std::strcmp(value, "Off") == 0);
+#endif
+    }();
+    return cached;
+}
+
 inline float max_abs_block(
     const float* X, std::size_t H, std::size_t tStart, std::size_t tEnd, std::size_t hStart, std::size_t hEnd)
 {
     float m = 0.0f;
+#if defined(__AVX2__)
+    if (activation_avx2_quant_enabled()) {
+        const __m256 signMask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fffffff));
+        __m256 vmax = _mm256_setzero_ps();
+        for (std::size_t t = tStart; t < tEnd; ++t) {
+            const float* row = X + t * H;
+            std::size_t h = hStart;
+            for (; h + 8 <= hEnd; h += 8) {
+                const __m256 v = _mm256_and_ps(_mm256_loadu_ps(row + h), signMask);
+                vmax = _mm256_max_ps(vmax, v);
+            }
+            for (; h < hEnd; ++h) {
+                const float a = std::fabs(row[h]);
+                if (a > m) m = a;
+            }
+        }
+        alignas(32) float tmp[8];
+        _mm256_store_ps(tmp, vmax);
+        for (float v : tmp) {
+            if (v > m) m = v;
+        }
+        return m;
+    }
+#endif
     for (std::size_t t = tStart; t < tEnd; ++t) {
         const float* row = X + t * H;
         for (std::size_t h = hStart; h < hEnd; ++h) {
@@ -120,6 +176,30 @@ inline __m256 decode_2bytes_to_ps(const uint8_t* ptr, __m256i shift_vec, __m256i
     v = _mm256_and_si256(v, mask_vec);
     v = _mm256_sub_epi32(v, one_vec);
     return _mm256_cvtepi32_ps(v);
+}
+
+inline void quantize_row_i8_avx2_no_clip(
+    int8_t* __restrict out,
+    const float* __restrict row,
+    std::size_t hStart,
+    std::size_t hEnd,
+    float inv)
+{
+    const __m256 inv8 = _mm256_set1_ps(inv);
+    std::size_t h = hStart;
+    for (; h + 8 <= hEnd; h += 8) {
+        const __m256 scaled = _mm256_mul_ps(_mm256_loadu_ps(row + h), inv8);
+        const __m256i i32 = _mm256_cvtps_epi32(scaled);
+        const __m128i lo = _mm256_castsi256_si128(i32);
+        const __m128i hi = _mm256_extracti128_si256(i32, 1);
+        const __m128i i16 = _mm_packs_epi32(lo, hi);
+        const __m128i i8 = _mm_packs_epi16(i16, _mm_setzero_si128());
+        _mm_storel_epi64(reinterpret_cast<__m128i*>(out + h), i8);
+    }
+    for (; h < hEnd; ++h) {
+        const int qi = static_cast<int>(std::lrint(row[h] * inv));
+        out[h] = static_cast<int8_t>(std::max(-127, std::min(127, qi)));
+    }
 }
 #endif
 
@@ -190,7 +270,7 @@ inline void quantize_x_tile_i8_tiled(
                 const float* row = X + t * H;
                 int8_t* outRow = Xi8 + (t - t0) * H;
                 if (clip == 0.0f) {
-                    for (std::size_t h = hStart; h < hEnd; ++h) outRow[h] = 0;
+                    std::memset(outRow + hStart, 0, hEnd - hStart);
                 }
                 else if (hadamard32) {
                     for (std::size_t h = hStart; h < hEnd; h += 32) {
@@ -206,6 +286,11 @@ inline void quantize_x_tile_i8_tiled(
                         }
                     }
                 }
+#if defined(__AVX2__)
+                else if (clipRmsFactor <= 0.0f && bitnet_i2s_detail::activation_avx2_quant_enabled()) {
+                    bitnet_i2s_detail::quantize_row_i8_avx2_no_clip(outRow, row, hStart, hEnd, inv);
+                }
+#endif
                 else {
                     for (std::size_t h = hStart; h < hEnd; ++h) {
                         const float v = (clipRmsFactor > 0.0f)
@@ -318,10 +403,8 @@ inline void quantize_x_tile_i8_tiled_dual(
                 int8_t* outRowA = Xi8A + (t - t0) * H;
                 int8_t* outRowB = Xi8B + (t - t0) * H;
                 if (clipA == 0.0f && clipB == 0.0f) {
-                    for (std::size_t h = hStart; h < hEnd; ++h) {
-                        outRowA[h] = 0;
-                        outRowB[h] = 0;
-                    }
+                    std::memset(outRowA + hStart, 0, hEnd - hStart);
+                    std::memset(outRowB + hStart, 0, hEnd - hStart);
                 }
                 else if (hadamard32) {
                     for (std::size_t h = hStart; h < hEnd; h += 32) {
@@ -357,6 +440,12 @@ inline void quantize_x_tile_i8_tiled_dual(
                         }
                     }
                 }
+#if defined(__AVX2__)
+                else if (clipRmsFactor <= 0.0f && clipA != 0.0f && clipB != 0.0f && bitnet_i2s_detail::activation_avx2_quant_enabled()) {
+                    bitnet_i2s_detail::quantize_row_i8_avx2_no_clip(outRowA, rowA, hStart, hEnd, invA);
+                    bitnet_i2s_detail::quantize_row_i8_avx2_no_clip(outRowB, rowB, hStart, hEnd, invB);
+                }
+#endif
                 else {
                     for (std::size_t h = hStart; h < hEnd; ++h) {
                         if (clipA == 0.0f) {
@@ -455,7 +544,7 @@ inline void quantize_x_tile_i8_tiled_omp_for(
                 const float* row = X + t * H;
                 int8_t* outRow = Xi8 + (t - t0) * H;
                 if (clip == 0.0f) {
-                    for (std::size_t h = hStart; h < hEnd; ++h) outRow[h] = 0;
+                    std::memset(outRow + hStart, 0, hEnd - hStart);
                 }
                 else if (hadamard32) {
                     for (std::size_t h = hStart; h < hEnd; h += 32) {
@@ -471,6 +560,11 @@ inline void quantize_x_tile_i8_tiled_omp_for(
                         }
                     }
                 }
+#if defined(__AVX2__)
+                else if (clipRmsFactor <= 0.0f && bitnet_i2s_detail::activation_avx2_quant_enabled()) {
+                    bitnet_i2s_detail::quantize_row_i8_avx2_no_clip(outRow, row, hStart, hEnd, inv);
+                }
+#endif
                 else {
                     for (std::size_t h = hStart; h < hEnd; ++h) {
                         const float v = (clipRmsFactor > 0.0f)
@@ -590,10 +684,8 @@ inline void quantize_x_tile_i8_tiled_dual_omp_for(
                 int8_t* outRowA = Xi8A + (t - t0) * H;
                 int8_t* outRowB = Xi8B + (t - t0) * H;
                 if (clipA == 0.0f && clipB == 0.0f) {
-                    for (std::size_t h = hStart; h < hEnd; ++h) {
-                        outRowA[h] = 0;
-                        outRowB[h] = 0;
-                    }
+                    std::memset(outRowA + hStart, 0, hEnd - hStart);
+                    std::memset(outRowB + hStart, 0, hEnd - hStart);
                 }
                 else if (hadamard32) {
                     for (std::size_t h = hStart; h < hEnd; h += 32) {
@@ -629,6 +721,12 @@ inline void quantize_x_tile_i8_tiled_dual_omp_for(
                         }
                     }
                 }
+#if defined(__AVX2__)
+                else if (clipRmsFactor <= 0.0f && clipA != 0.0f && clipB != 0.0f && bitnet_i2s_detail::activation_avx2_quant_enabled()) {
+                    bitnet_i2s_detail::quantize_row_i8_avx2_no_clip(outRowA, rowA, hStart, hEnd, invA);
+                    bitnet_i2s_detail::quantize_row_i8_avx2_no_clip(outRowB, rowB, hStart, hEnd, invB);
+                }
+#endif
                 else {
                     for (std::size_t h = hStart; h < hEnd; ++h) {
                         if (clipA == 0.0f) {
@@ -903,6 +1001,212 @@ inline void dot_i2s_i8_accum_i32_block32_x4(
 #else
     dot_i2s_i8_accum_i32_block32_x2(accA, accB, Wq2, stride_cols, i0, hCount, x8A, x8B, j0);
     dot_i2s_i8_accum_i32_block32_x2(accC, accD, Wq2, stride_cols, i0, hCount, x8C, x8D, j0);
+#endif
+}
+
+inline void dot_ternary_i8_accum_i32_block32(
+    int32_t* __restrict acc32, const int8_t* __restrict Wt8, std::size_t stride_cols,
+    std::size_t j0, std::size_t hCount, const int8_t* __restrict dy8, std::size_t i0)
+{
+#if defined(__AVX2__)
+    __m256 a0 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc32 + 0)));
+    __m256 a1 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc32 + 8)));
+    __m256 a2 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc32 + 16)));
+    __m256 a3 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc32 + 24)));
+
+    for (std::size_t di = 0; di < hCount; ++di) {
+        if (dy8[di] == 0) continue;
+        const int8_t* const w = Wt8 + (j0 + di) * stride_cols + i0;
+        _mm_prefetch(reinterpret_cast<const char*>(w + stride_cols), _MM_HINT_T0);
+        const __m256 x = _mm256_set1_ps(static_cast<float>(dy8[di]));
+        const __m256 w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 0))));
+        const __m256 w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 8))));
+        const __m256 w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 16))));
+        const __m256 w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 24))));
+        a0 = _mm256_fmadd_ps(x, w0, a0);
+        a1 = _mm256_fmadd_ps(x, w1, a1);
+        a2 = _mm256_fmadd_ps(x, w2, a2);
+        a3 = _mm256_fmadd_ps(x, w3, a3);
+    }
+
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc32 + 0), _mm256_cvtps_epi32(a0));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc32 + 8), _mm256_cvtps_epi32(a1));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc32 + 16), _mm256_cvtps_epi32(a2));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc32 + 24), _mm256_cvtps_epi32(a3));
+#else
+    for (std::size_t di = 0; di < hCount; ++di) {
+        const int x = static_cast<int>(dy8[di]);
+        if (x == 0) continue;
+        const int8_t* const w = Wt8 + (j0 + di) * stride_cols + i0;
+        for (std::size_t u = 0; u < 32; ++u) {
+            acc32[u] += x * static_cast<int>(w[u]);
+        }
+    }
+#endif
+}
+
+inline void dot_ternary_i8_accum_i32_block32_x2(
+    int32_t* __restrict accA, int32_t* __restrict accB, const int8_t* __restrict Wt8,
+    std::size_t stride_cols, std::size_t j0, std::size_t hCount,
+    const int8_t* __restrict dyA, const int8_t* __restrict dyB, std::size_t i0)
+{
+#if defined(__AVX2__)
+    __m256 aA0 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accA + 0)));
+    __m256 aA1 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accA + 8)));
+    __m256 aA2 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accA + 16)));
+    __m256 aA3 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accA + 24)));
+    __m256 aB0 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accB + 0)));
+    __m256 aB1 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accB + 8)));
+    __m256 aB2 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accB + 16)));
+    __m256 aB3 = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accB + 24)));
+
+    for (std::size_t di = 0; di < hCount; ++di) {
+        if (!(dyA[di] | dyB[di])) continue;
+        const int8_t* const w = Wt8 + (j0 + di) * stride_cols + i0;
+        _mm_prefetch(reinterpret_cast<const char*>(w + stride_cols), _MM_HINT_T0);
+        const __m256 w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 0))));
+        const __m256 w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 8))));
+        const __m256 w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 16))));
+        const __m256 w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 24))));
+        if (dyA[di]) {
+            const __m256 x = _mm256_set1_ps(static_cast<float>(dyA[di]));
+            aA0 = _mm256_fmadd_ps(x, w0, aA0); aA1 = _mm256_fmadd_ps(x, w1, aA1);
+            aA2 = _mm256_fmadd_ps(x, w2, aA2); aA3 = _mm256_fmadd_ps(x, w3, aA3);
+        }
+        if (dyB[di]) {
+            const __m256 x = _mm256_set1_ps(static_cast<float>(dyB[di]));
+            aB0 = _mm256_fmadd_ps(x, w0, aB0); aB1 = _mm256_fmadd_ps(x, w1, aB1);
+            aB2 = _mm256_fmadd_ps(x, w2, aB2); aB3 = _mm256_fmadd_ps(x, w3, aB3);
+        }
+    }
+
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(accA + 0), _mm256_cvtps_epi32(aA0));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(accA + 8), _mm256_cvtps_epi32(aA1));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(accA + 16), _mm256_cvtps_epi32(aA2));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(accA + 24), _mm256_cvtps_epi32(aA3));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(accB + 0), _mm256_cvtps_epi32(aB0));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(accB + 8), _mm256_cvtps_epi32(aB1));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(accB + 16), _mm256_cvtps_epi32(aB2));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(accB + 24), _mm256_cvtps_epi32(aB3));
+#else
+    for (std::size_t di = 0; di < hCount; ++di) {
+        const int xa = static_cast<int>(dyA[di]);
+        const int xb = static_cast<int>(dyB[di]);
+        if (xa == 0 && xb == 0) continue;
+        const int8_t* const w = Wt8 + (j0 + di) * stride_cols + i0;
+        for (std::size_t u = 0; u < 32; ++u) {
+            const int wi = static_cast<int>(w[u]);
+            if (xa) accA[u] += xa * wi;
+            if (xb) accB[u] += xb * wi;
+        }
+    }
+#endif
+}
+
+inline void dot_ternary_i8_accum_i32_block32_x4(
+    int32_t* __restrict accA, int32_t* __restrict accB,
+    int32_t* __restrict accC, int32_t* __restrict accD,
+    const int8_t* __restrict Wt8, std::size_t stride_cols,
+    std::size_t j0, std::size_t hCount,
+    const int8_t* __restrict dyA, const int8_t* __restrict dyB,
+    const int8_t* __restrict dyC, const int8_t* __restrict dyD,
+    std::size_t i0)
+{
+    dot_ternary_i8_accum_i32_block32_x2(accA, accB, Wt8, stride_cols, j0, hCount, dyA, dyB, i0);
+    dot_ternary_i8_accum_i32_block32_x2(accC, accD, Wt8, stride_cols, j0, hCount, dyC, dyD, i0);
+}
+
+inline void dot_ternary_i8_accum_i32_block32_x4_triple(
+    int32_t* __restrict accQA, int32_t* __restrict accQB,
+    int32_t* __restrict accQC, int32_t* __restrict accQD,
+    int32_t* __restrict accKA, int32_t* __restrict accKB,
+    int32_t* __restrict accKC, int32_t* __restrict accKD,
+    int32_t* __restrict accVA, int32_t* __restrict accVB,
+    int32_t* __restrict accVC, int32_t* __restrict accVD,
+    const int8_t* __restrict WqT8,
+    const int8_t* __restrict WkT8,
+    const int8_t* __restrict WvT8,
+    std::size_t stride_cols,
+    std::size_t j0, std::size_t hCount,
+    const int8_t* __restrict dqA, const int8_t* __restrict dqB,
+    const int8_t* __restrict dqC, const int8_t* __restrict dqD,
+    const int8_t* __restrict dkA, const int8_t* __restrict dkB,
+    const int8_t* __restrict dkC, const int8_t* __restrict dkD,
+    const int8_t* __restrict dvA, const int8_t* __restrict dvB,
+    const int8_t* __restrict dvC, const int8_t* __restrict dvD,
+    std::size_t i0)
+{
+#if defined(__AVX2__)
+    auto run_half = [&](int accOffset) {
+        __m256 qA = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accQA + accOffset)));
+        __m256 qB = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accQB + accOffset)));
+        __m256 qC = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accQC + accOffset)));
+        __m256 qD = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accQD + accOffset)));
+        __m256 kA = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accKA + accOffset)));
+        __m256 kB = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accKB + accOffset)));
+        __m256 kC = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accKC + accOffset)));
+        __m256 kD = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accKD + accOffset)));
+        __m256 vA = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accVA + accOffset)));
+        __m256 vB = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accVB + accOffset)));
+        __m256 vC = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accVC + accOffset)));
+        __m256 vD = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(accVD + accOffset)));
+
+        for (std::size_t di = 0; di < hCount; ++di) {
+            const int8_t q0 = dqA[di], q1 = dqB[di], q2 = dqC[di], q3 = dqD[di];
+            const int8_t k0 = dkA[di], k1 = dkB[di], k2 = dkC[di], k3 = dkD[di];
+            const int8_t v0 = dvA[di], v1 = dvB[di], v2 = dvC[di], v3 = dvD[di];
+            if (!(q0 | q1 | q2 | q3 | k0 | k1 | k2 | k3 | v0 | v1 | v2 | v3)) continue;
+
+            const int8_t* const wq = WqT8 + (j0 + di) * stride_cols + i0 + accOffset;
+            const int8_t* const wk = WkT8 + (j0 + di) * stride_cols + i0 + accOffset;
+            const int8_t* const wv = WvT8 + (j0 + di) * stride_cols + i0 + accOffset;
+            _mm_prefetch(reinterpret_cast<const char*>(wq + stride_cols), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(wk + stride_cols), _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(wv + stride_cols), _MM_HINT_T0);
+
+            const __m256 wq8 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(wq))));
+            const __m256 wk8 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(wk))));
+            const __m256 wv8 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                _mm_loadl_epi64(reinterpret_cast<const __m128i*>(wv))));
+
+            if (q0) qA = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(q0)), wq8, qA);
+            if (q1) qB = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(q1)), wq8, qB);
+            if (q2) qC = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(q2)), wq8, qC);
+            if (q3) qD = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(q3)), wq8, qD);
+            if (k0) kA = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(k0)), wk8, kA);
+            if (k1) kB = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(k1)), wk8, kB);
+            if (k2) kC = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(k2)), wk8, kC);
+            if (k3) kD = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(k3)), wk8, kD);
+            if (v0) vA = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(v0)), wv8, vA);
+            if (v1) vB = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(v1)), wv8, vB);
+            if (v2) vC = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(v2)), wv8, vC);
+            if (v3) vD = _mm256_fmadd_ps(_mm256_set1_ps(static_cast<float>(v3)), wv8, vD);
+        }
+
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accQA + accOffset), _mm256_cvtps_epi32(qA));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accQB + accOffset), _mm256_cvtps_epi32(qB));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accQC + accOffset), _mm256_cvtps_epi32(qC));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accQD + accOffset), _mm256_cvtps_epi32(qD));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accKA + accOffset), _mm256_cvtps_epi32(kA));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accKB + accOffset), _mm256_cvtps_epi32(kB));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accKC + accOffset), _mm256_cvtps_epi32(kC));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accKD + accOffset), _mm256_cvtps_epi32(kD));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accVA + accOffset), _mm256_cvtps_epi32(vA));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accVB + accOffset), _mm256_cvtps_epi32(vB));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accVC + accOffset), _mm256_cvtps_epi32(vC));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(accVD + accOffset), _mm256_cvtps_epi32(vD));
+    };
+
+    run_half(0);
+    run_half(8);
+    run_half(16);
+    run_half(24);
+#else
+    dot_ternary_i8_accum_i32_block32_x4(accQA, accQB, accQC, accQD, WqT8, stride_cols, j0, hCount, dqA, dqB, dqC, dqD, i0);
+    dot_ternary_i8_accum_i32_block32_x4(accKA, accKB, accKC, accKD, WkT8, stride_cols, j0, hCount, dkA, dkB, dkC, dkD, i0);
+    dot_ternary_i8_accum_i32_block32_x4(accVA, accVB, accVC, accVD, WvT8, stride_cols, j0, hCount, dvA, dvB, dvC, dvD, i0);
 #endif
 }
 
@@ -1205,31 +1509,31 @@ inline void dot_i2s_i8_scale_store_block32_x4(
         const __m256 gainD8 = _mm256_set1_ps(gainD);
 
         __m256 yv = _mm256_loadu_ps(yA + j0 + 0);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aA0)), gainA8, yv);
+        yv = _mm256_fmadd_ps(aA0, gainA8, yv);
         _mm256_storeu_ps(yA + j0 + 0, yv);
         yv = _mm256_loadu_ps(yA + j0 + 8);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aA1)), gainA8, yv);
+        yv = _mm256_fmadd_ps(aA1, gainA8, yv);
         _mm256_storeu_ps(yA + j0 + 8, yv);
 
         yv = _mm256_loadu_ps(yB + j0 + 0);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aB0)), gainB8, yv);
+        yv = _mm256_fmadd_ps(aB0, gainB8, yv);
         _mm256_storeu_ps(yB + j0 + 0, yv);
         yv = _mm256_loadu_ps(yB + j0 + 8);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aB1)), gainB8, yv);
+        yv = _mm256_fmadd_ps(aB1, gainB8, yv);
         _mm256_storeu_ps(yB + j0 + 8, yv);
 
         yv = _mm256_loadu_ps(yC + j0 + 0);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aC0)), gainC8, yv);
+        yv = _mm256_fmadd_ps(aC0, gainC8, yv);
         _mm256_storeu_ps(yC + j0 + 0, yv);
         yv = _mm256_loadu_ps(yC + j0 + 8);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aC1)), gainC8, yv);
+        yv = _mm256_fmadd_ps(aC1, gainC8, yv);
         _mm256_storeu_ps(yC + j0 + 8, yv);
 
         yv = _mm256_loadu_ps(yD + j0 + 0);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aD0)), gainD8, yv);
+        yv = _mm256_fmadd_ps(aD0, gainD8, yv);
         _mm256_storeu_ps(yD + j0 + 0, yv);
         yv = _mm256_loadu_ps(yD + j0 + 8);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aD1)), gainD8, yv);
+        yv = _mm256_fmadd_ps(aD1, gainD8, yv);
         _mm256_storeu_ps(yD + j0 + 8, yv);
     }
 
@@ -1279,31 +1583,31 @@ inline void dot_i2s_i8_scale_store_block32_x4(
         const __m256 gainD8 = _mm256_set1_ps(gainD);
 
         __m256 yv = _mm256_loadu_ps(yA + j0 + 16);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aA2)), gainA8, yv);
+        yv = _mm256_fmadd_ps(aA2, gainA8, yv);
         _mm256_storeu_ps(yA + j0 + 16, yv);
         yv = _mm256_loadu_ps(yA + j0 + 24);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aA3)), gainA8, yv);
+        yv = _mm256_fmadd_ps(aA3, gainA8, yv);
         _mm256_storeu_ps(yA + j0 + 24, yv);
 
         yv = _mm256_loadu_ps(yB + j0 + 16);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aB2)), gainB8, yv);
+        yv = _mm256_fmadd_ps(aB2, gainB8, yv);
         _mm256_storeu_ps(yB + j0 + 16, yv);
         yv = _mm256_loadu_ps(yB + j0 + 24);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aB3)), gainB8, yv);
+        yv = _mm256_fmadd_ps(aB3, gainB8, yv);
         _mm256_storeu_ps(yB + j0 + 24, yv);
 
         yv = _mm256_loadu_ps(yC + j0 + 16);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aC2)), gainC8, yv);
+        yv = _mm256_fmadd_ps(aC2, gainC8, yv);
         _mm256_storeu_ps(yC + j0 + 16, yv);
         yv = _mm256_loadu_ps(yC + j0 + 24);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aC3)), gainC8, yv);
+        yv = _mm256_fmadd_ps(aC3, gainC8, yv);
         _mm256_storeu_ps(yC + j0 + 24, yv);
 
         yv = _mm256_loadu_ps(yD + j0 + 16);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aD2)), gainD8, yv);
+        yv = _mm256_fmadd_ps(aD2, gainD8, yv);
         _mm256_storeu_ps(yD + j0 + 16, yv);
         yv = _mm256_loadu_ps(yD + j0 + 24);
-        yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aD3)), gainD8, yv);
+        yv = _mm256_fmadd_ps(aD3, gainD8, yv);
         _mm256_storeu_ps(yD + j0 + 24, yv);
     }
 #else
@@ -1382,14 +1686,14 @@ inline void dot_i2s_i8_scale_store_block16_x4_exact(
     const __m256 gainC8 = _mm256_set1_ps(gainC);
     const __m256 gainD8 = _mm256_set1_ps(gainD);
 
-    const __m256 outA0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aA0)), gainA8);
-    const __m256 outA1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aA1)), gainA8);
-    const __m256 outB0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aB0)), gainB8);
-    const __m256 outB1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aB1)), gainB8);
-    const __m256 outC0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aC0)), gainC8);
-    const __m256 outC1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aC1)), gainC8);
-    const __m256 outD0 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aD0)), gainD8);
-    const __m256 outD1 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aD1)), gainD8);
+    const __m256 outA0 = _mm256_mul_ps(aA0, gainA8);
+    const __m256 outA1 = _mm256_mul_ps(aA1, gainA8);
+    const __m256 outB0 = _mm256_mul_ps(aB0, gainB8);
+    const __m256 outB1 = _mm256_mul_ps(aB1, gainB8);
+    const __m256 outC0 = _mm256_mul_ps(aC0, gainC8);
+    const __m256 outC1 = _mm256_mul_ps(aC1, gainC8);
+    const __m256 outD0 = _mm256_mul_ps(aD0, gainD8);
+    const __m256 outD1 = _mm256_mul_ps(aD1, gainD8);
 
     if (addToDest) {
         __m256 yv = _mm256_loadu_ps(yA + j0 + 0);
@@ -1500,17 +1804,17 @@ inline void dot_i2s_i8_scale_store_block16_x2_exact(
     const __m256 gainB8 = _mm256_set1_ps(gainB);
 
     __m256 yv = _mm256_loadu_ps(yA + j0 + 0);
-    yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aA0)), gainA8, yv);
+    yv = _mm256_fmadd_ps(aA0, gainA8, yv);
     _mm256_storeu_ps(yA + j0 + 0, yv);
     yv = _mm256_loadu_ps(yA + j0 + 8);
-    yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aA1)), gainA8, yv);
+    yv = _mm256_fmadd_ps(aA1, gainA8, yv);
     _mm256_storeu_ps(yA + j0 + 8, yv);
 
     yv = _mm256_loadu_ps(yB + j0 + 0);
-    yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aB0)), gainB8, yv);
+    yv = _mm256_fmadd_ps(aB0, gainB8, yv);
     _mm256_storeu_ps(yB + j0 + 0, yv);
     yv = _mm256_loadu_ps(yB + j0 + 8);
-    yv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(aB1)), gainB8, yv);
+    yv = _mm256_fmadd_ps(aB1, gainB8, yv);
     _mm256_storeu_ps(yB + j0 + 8, yv);
 #else
     int32_t accA[32] = { 0 }, accB[32] = { 0 };
@@ -1591,22 +1895,22 @@ inline void dot_i2s_i8_scale_store_block16_x4_dual_exact(
     const __m256 gb0 = _mm256_set1_ps(gainB0), gb1 = _mm256_set1_ps(gainB1);
     const __m256 gb2 = _mm256_set1_ps(gainB2), gb3 = _mm256_set1_ps(gainB3);
 
-    const __m256 outA00 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), ga0);
-    const __m256 outA01 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), ga0);
-    const __m256 outA10 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), ga1);
-    const __m256 outA11 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), ga1);
-    const __m256 outA20 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a20)), ga2);
-    const __m256 outA21 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a21)), ga2);
-    const __m256 outA30 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a30)), ga3);
-    const __m256 outA31 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a31)), ga3);
-    const __m256 outB00 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b00)), gb0);
-    const __m256 outB01 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b01)), gb0);
-    const __m256 outB10 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b10)), gb1);
-    const __m256 outB11 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b11)), gb1);
-    const __m256 outB20 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b20)), gb2);
-    const __m256 outB21 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b21)), gb2);
-    const __m256 outB30 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b30)), gb3);
-    const __m256 outB31 = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b31)), gb3);
+    const __m256 outA00 = _mm256_mul_ps(a00, ga0);
+    const __m256 outA01 = _mm256_mul_ps(a01, ga0);
+    const __m256 outA10 = _mm256_mul_ps(a10, ga1);
+    const __m256 outA11 = _mm256_mul_ps(a11, ga1);
+    const __m256 outA20 = _mm256_mul_ps(a20, ga2);
+    const __m256 outA21 = _mm256_mul_ps(a21, ga2);
+    const __m256 outA30 = _mm256_mul_ps(a30, ga3);
+    const __m256 outA31 = _mm256_mul_ps(a31, ga3);
+    const __m256 outB00 = _mm256_mul_ps(b00, gb0);
+    const __m256 outB01 = _mm256_mul_ps(b01, gb0);
+    const __m256 outB10 = _mm256_mul_ps(b10, gb1);
+    const __m256 outB11 = _mm256_mul_ps(b11, gb1);
+    const __m256 outB20 = _mm256_mul_ps(b20, gb2);
+    const __m256 outB21 = _mm256_mul_ps(b21, gb2);
+    const __m256 outB30 = _mm256_mul_ps(b30, gb3);
+    const __m256 outB31 = _mm256_mul_ps(b31, gb3);
 
     if (addToDest) {
         __m256 yv = _mm256_loadu_ps(yA0 + j0 + 0); yv = _mm256_add_ps(outA00, yv); _mm256_storeu_ps(yA0 + j0 + 0, yv);
@@ -1739,39 +2043,39 @@ inline void dot_i2s_i8_scale_store_block16_x4_dual_bwd_exact(
     const __m256 gb2 = _mm256_set1_ps(gainB2), gb3 = _mm256_set1_ps(gainB3);
 
     __m256 xv = _mm256_loadu_ps(x0 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), ga0, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b00)), gb0, xv);
+    xv = _mm256_fmadd_ps(a00, ga0, xv);
+    xv = _mm256_fmadd_ps(b00, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x0 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), ga0, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b01)), gb0, xv);
+    xv = _mm256_fmadd_ps(a01, ga0, xv);
+    xv = _mm256_fmadd_ps(b01, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x1 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), ga1, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b10)), gb1, xv);
+    xv = _mm256_fmadd_ps(a10, ga1, xv);
+    xv = _mm256_fmadd_ps(b10, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x1 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), ga1, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b11)), gb1, xv);
+    xv = _mm256_fmadd_ps(a11, ga1, xv);
+    xv = _mm256_fmadd_ps(b11, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x2 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a20)), ga2, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b20)), gb2, xv);
+    xv = _mm256_fmadd_ps(a20, ga2, xv);
+    xv = _mm256_fmadd_ps(b20, gb2, xv);
     _mm256_storeu_ps(x2 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x2 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a21)), ga2, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b21)), gb2, xv);
+    xv = _mm256_fmadd_ps(a21, ga2, xv);
+    xv = _mm256_fmadd_ps(b21, gb2, xv);
     _mm256_storeu_ps(x2 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x3 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a30)), ga3, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b30)), gb3, xv);
+    xv = _mm256_fmadd_ps(a30, ga3, xv);
+    xv = _mm256_fmadd_ps(b30, gb3, xv);
     _mm256_storeu_ps(x3 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x3 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a31)), ga3, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b31)), gb3, xv);
+    xv = _mm256_fmadd_ps(a31, ga3, xv);
+    xv = _mm256_fmadd_ps(b31, gb3, xv);
     _mm256_storeu_ps(x3 + i0 + 8, xv);
 #else
     int32_t accA0[32] = { 0 }, accA1[32] = { 0 }, accA2[32] = { 0 }, accA3[32] = { 0 };
@@ -1841,21 +2145,21 @@ inline void dot_i2s_i8_scale_store_block16_x2_dual_bwd_exact(
     const __m256 ga0 = _mm256_set1_ps(gainA0), ga1 = _mm256_set1_ps(gainA1);
     const __m256 gb0 = _mm256_set1_ps(gainB0), gb1 = _mm256_set1_ps(gainB1);
     __m256 xv = _mm256_loadu_ps(x0 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), ga0, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b00)), gb0, xv);
+    xv = _mm256_fmadd_ps(a00, ga0, xv);
+    xv = _mm256_fmadd_ps(b00, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x0 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), ga0, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b01)), gb0, xv);
+    xv = _mm256_fmadd_ps(a01, ga0, xv);
+    xv = _mm256_fmadd_ps(b01, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x1 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), ga1, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b10)), gb1, xv);
+    xv = _mm256_fmadd_ps(a10, ga1, xv);
+    xv = _mm256_fmadd_ps(b10, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x1 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), ga1, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b11)), gb1, xv);
+    xv = _mm256_fmadd_ps(a11, ga1, xv);
+    xv = _mm256_fmadd_ps(b11, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 #else
     int32_t accA0[32] = { 0 }, accA1[32] = { 0 };
@@ -1921,21 +2225,21 @@ inline void dot_i2s_i8_scale_store_block16_x2_dual_bwd_exact_dense(
     const __m256 ga0 = _mm256_set1_ps(gainA0), ga1 = _mm256_set1_ps(gainA1);
     const __m256 gb0 = _mm256_set1_ps(gainB0), gb1 = _mm256_set1_ps(gainB1);
     __m256 xv = _mm256_loadu_ps(x0 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), ga0, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b00)), gb0, xv);
+    xv = _mm256_fmadd_ps(a00, ga0, xv);
+    xv = _mm256_fmadd_ps(b00, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x0 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), ga0, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b01)), gb0, xv);
+    xv = _mm256_fmadd_ps(a01, ga0, xv);
+    xv = _mm256_fmadd_ps(b01, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x1 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), ga1, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b10)), gb1, xv);
+    xv = _mm256_fmadd_ps(a10, ga1, xv);
+    xv = _mm256_fmadd_ps(b10, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x1 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), ga1, xv);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b11)), gb1, xv);
+    xv = _mm256_fmadd_ps(a11, ga1, xv);
+    xv = _mm256_fmadd_ps(b11, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 #else
     dot_i2s_i8_scale_store_block16_x2_dual_bwd_exact(
@@ -1993,18 +2297,18 @@ inline void dot_i2s_i8_scale_store_block16_x2_dual_bwd_exact_overwrite(
 
     const __m256 ga0 = _mm256_set1_ps(gainA0), ga1 = _mm256_set1_ps(gainA1);
     const __m256 gb0 = _mm256_set1_ps(gainB0), gb1 = _mm256_set1_ps(gainB1);
-    __m256 xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), ga0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b00)), gb0, xv);
+    __m256 xv = _mm256_mul_ps(a00, ga0);
+    xv = _mm256_fmadd_ps(b00, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), ga0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b01)), gb0, xv);
+    xv = _mm256_mul_ps(a01, ga0);
+    xv = _mm256_fmadd_ps(b01, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), ga1);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b10)), gb1, xv);
+    xv = _mm256_mul_ps(a10, ga1);
+    xv = _mm256_fmadd_ps(b10, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), ga1);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b11)), gb1, xv);
+    xv = _mm256_mul_ps(a11, ga1);
+    xv = _mm256_fmadd_ps(b11, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 #else
     int32_t accA0[32] = { 0 }, accA1[32] = { 0 };
@@ -2065,18 +2369,18 @@ inline void dot_i2s_i8_scale_store_block16_x2_dual_bwd_exact_overwrite_dense(
 
     const __m256 ga0 = _mm256_set1_ps(gainA0), ga1 = _mm256_set1_ps(gainA1);
     const __m256 gb0 = _mm256_set1_ps(gainB0), gb1 = _mm256_set1_ps(gainB1);
-    __m256 xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), ga0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b00)), gb0, xv);
+    __m256 xv = _mm256_mul_ps(a00, ga0);
+    xv = _mm256_fmadd_ps(b00, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), ga0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b01)), gb0, xv);
+    xv = _mm256_mul_ps(a01, ga0);
+    xv = _mm256_fmadd_ps(b01, gb0, xv);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), ga1);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b10)), gb1, xv);
+    xv = _mm256_mul_ps(a10, ga1);
+    xv = _mm256_fmadd_ps(b10, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), ga1);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(b11)), gb1, xv);
+    xv = _mm256_mul_ps(a11, ga1);
+    xv = _mm256_fmadd_ps(b11, gb1, xv);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 #else
     dot_i2s_i8_scale_store_block16_x2_dual_bwd_exact_overwrite(
@@ -2126,31 +2430,31 @@ inline void dot_i2s_i8_scale_store_block16_x4_bwd_exact(
     const __m256 g2 = _mm256_set1_ps(gain2), g3 = _mm256_set1_ps(gain3);
 
     __m256 xv = _mm256_loadu_ps(x0 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), g0, xv);
+    xv = _mm256_fmadd_ps(a00, g0, xv);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x0 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), g0, xv);
+    xv = _mm256_fmadd_ps(a01, g0, xv);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x1 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), g1, xv);
+    xv = _mm256_fmadd_ps(a10, g1, xv);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x1 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), g1, xv);
+    xv = _mm256_fmadd_ps(a11, g1, xv);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x2 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a20)), g2, xv);
+    xv = _mm256_fmadd_ps(a20, g2, xv);
     _mm256_storeu_ps(x2 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x2 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a21)), g2, xv);
+    xv = _mm256_fmadd_ps(a21, g2, xv);
     _mm256_storeu_ps(x2 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x3 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a30)), g3, xv);
+    xv = _mm256_fmadd_ps(a30, g3, xv);
     _mm256_storeu_ps(x3 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x3 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a31)), g3, xv);
+    xv = _mm256_fmadd_ps(a31, g3, xv);
     _mm256_storeu_ps(x3 + i0 + 8, xv);
 #else
     int32_t acc0[32] = { 0 }, acc1[32] = { 0 }, acc2[32] = { 0 }, acc3[32] = { 0 };
@@ -2205,24 +2509,24 @@ inline void dot_i2s_i8_scale_store_block16_x4_bwd_exact_overwrite(
     const __m256 g0 = _mm256_set1_ps(gain0), g1 = _mm256_set1_ps(gain1);
     const __m256 g2 = _mm256_set1_ps(gain2), g3 = _mm256_set1_ps(gain3);
 
-    __m256 xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), g0);
+    __m256 xv = _mm256_mul_ps(a00, g0);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), g0);
+    xv = _mm256_mul_ps(a01, g0);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), g1);
+    xv = _mm256_mul_ps(a10, g1);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), g1);
+    xv = _mm256_mul_ps(a11, g1);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a20)), g2);
+    xv = _mm256_mul_ps(a20, g2);
     _mm256_storeu_ps(x2 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a21)), g2);
+    xv = _mm256_mul_ps(a21, g2);
     _mm256_storeu_ps(x2 + i0 + 8, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a30)), g3);
+    xv = _mm256_mul_ps(a30, g3);
     _mm256_storeu_ps(x3 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a31)), g3);
+    xv = _mm256_mul_ps(a31, g3);
     _mm256_storeu_ps(x3 + i0 + 8, xv);
 #else
     int32_t acc0[32] = { 0 }, acc1[32] = { 0 }, acc2[32] = { 0 }, acc3[32] = { 0 };
@@ -2295,61 +2599,283 @@ inline void dot_i2s_i8_scale_store_block32_x4_bwd_exact(
     const __m256 g2 = _mm256_set1_ps(gain2), g3 = _mm256_set1_ps(gain3);
 
     __m256 xv = _mm256_loadu_ps(x0 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), g0, xv);
+    xv = _mm256_fmadd_ps(a00, g0, xv);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x0 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), g0, xv);
+    xv = _mm256_fmadd_ps(a01, g0, xv);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
     xv = _mm256_loadu_ps(x0 + i0 + 16);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a02)), g0, xv);
+    xv = _mm256_fmadd_ps(a02, g0, xv);
     _mm256_storeu_ps(x0 + i0 + 16, xv);
     xv = _mm256_loadu_ps(x0 + i0 + 24);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a03)), g0, xv);
+    xv = _mm256_fmadd_ps(a03, g0, xv);
     _mm256_storeu_ps(x0 + i0 + 24, xv);
 
     xv = _mm256_loadu_ps(x1 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), g1, xv);
+    xv = _mm256_fmadd_ps(a10, g1, xv);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x1 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), g1, xv);
+    xv = _mm256_fmadd_ps(a11, g1, xv);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
     xv = _mm256_loadu_ps(x1 + i0 + 16);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a12)), g1, xv);
+    xv = _mm256_fmadd_ps(a12, g1, xv);
     _mm256_storeu_ps(x1 + i0 + 16, xv);
     xv = _mm256_loadu_ps(x1 + i0 + 24);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a13)), g1, xv);
+    xv = _mm256_fmadd_ps(a13, g1, xv);
     _mm256_storeu_ps(x1 + i0 + 24, xv);
 
     xv = _mm256_loadu_ps(x2 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a20)), g2, xv);
+    xv = _mm256_fmadd_ps(a20, g2, xv);
     _mm256_storeu_ps(x2 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x2 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a21)), g2, xv);
+    xv = _mm256_fmadd_ps(a21, g2, xv);
     _mm256_storeu_ps(x2 + i0 + 8, xv);
     xv = _mm256_loadu_ps(x2 + i0 + 16);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a22)), g2, xv);
+    xv = _mm256_fmadd_ps(a22, g2, xv);
     _mm256_storeu_ps(x2 + i0 + 16, xv);
     xv = _mm256_loadu_ps(x2 + i0 + 24);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a23)), g2, xv);
+    xv = _mm256_fmadd_ps(a23, g2, xv);
     _mm256_storeu_ps(x2 + i0 + 24, xv);
 
     xv = _mm256_loadu_ps(x3 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a30)), g3, xv);
+    xv = _mm256_fmadd_ps(a30, g3, xv);
     _mm256_storeu_ps(x3 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x3 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a31)), g3, xv);
+    xv = _mm256_fmadd_ps(a31, g3, xv);
     _mm256_storeu_ps(x3 + i0 + 8, xv);
     xv = _mm256_loadu_ps(x3 + i0 + 16);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a32)), g3, xv);
+    xv = _mm256_fmadd_ps(a32, g3, xv);
     _mm256_storeu_ps(x3 + i0 + 16, xv);
     xv = _mm256_loadu_ps(x3 + i0 + 24);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a33)), g3, xv);
+    xv = _mm256_fmadd_ps(a33, g3, xv);
     _mm256_storeu_ps(x3 + i0 + 24, xv);
 #else
     int32_t acc0[32] = { 0 }, acc1[32] = { 0 }, acc2[32] = { 0 }, acc3[32] = { 0 };
     dot_i2s_i8_accum_i32_block32_x4(acc0, acc1, acc2, acc3, Wq2, stride_cols, j0, hCount, dy0, dy1, dy2, dy3, i0);
     accum_bwd_block32_gain_to_x_pair(x0, x1, acc0, acc1, i0, gain0, gain1, addToDest);
     accum_bwd_block32_gain_to_x_pair(x2, x3, acc2, acc3, i0, gain2, gain3, addToDest);
+#endif
+}
+
+inline void dot_ternary_i8_scale_store_block32_x4_bwd_exact(
+    float* __restrict x0, float* __restrict x1,
+    float* __restrict x2, float* __restrict x3,
+    const int8_t* __restrict Wt8,
+    std::size_t stride_cols, std::size_t j0, std::size_t hCount,
+    const int8_t* __restrict dy0, const int8_t* __restrict dy1,
+    const int8_t* __restrict dy2, const int8_t* __restrict dy3,
+    std::size_t i0,
+    float gain0, float gain1, float gain2, float gain3)
+{
+#if defined(__AVX2__)
+    __m256 a00 = _mm256_setzero_ps(), a01 = _mm256_setzero_ps(), a02 = _mm256_setzero_ps(), a03 = _mm256_setzero_ps();
+    __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps(), a12 = _mm256_setzero_ps(), a13 = _mm256_setzero_ps();
+    __m256 a20 = _mm256_setzero_ps(), a21 = _mm256_setzero_ps(), a22 = _mm256_setzero_ps(), a23 = _mm256_setzero_ps();
+    __m256 a30 = _mm256_setzero_ps(), a31 = _mm256_setzero_ps(), a32 = _mm256_setzero_ps(), a33 = _mm256_setzero_ps();
+
+    for (std::size_t di = 0; di < hCount; ++di) {
+        if (!(dy0[di] | dy1[di] | dy2[di] | dy3[di])) continue;
+        const int8_t* w = Wt8 + (j0 + di) * stride_cols + i0;
+        _mm_prefetch(reinterpret_cast<const char*>(w + stride_cols), _MM_HINT_T0);
+
+        const __m256 w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 0))));
+        const __m256 w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 8))));
+        const __m256 w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 16))));
+        const __m256 w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 24))));
+
+        if (dy0[di]) {
+            const __m256 vx = _mm256_set1_ps(static_cast<float>(dy0[di]));
+            a00 = _mm256_fmadd_ps(vx, w0, a00); a01 = _mm256_fmadd_ps(vx, w1, a01);
+            a02 = _mm256_fmadd_ps(vx, w2, a02); a03 = _mm256_fmadd_ps(vx, w3, a03);
+        }
+        if (dy1[di]) {
+            const __m256 vx = _mm256_set1_ps(static_cast<float>(dy1[di]));
+            a10 = _mm256_fmadd_ps(vx, w0, a10); a11 = _mm256_fmadd_ps(vx, w1, a11);
+            a12 = _mm256_fmadd_ps(vx, w2, a12); a13 = _mm256_fmadd_ps(vx, w3, a13);
+        }
+        if (dy2[di]) {
+            const __m256 vx = _mm256_set1_ps(static_cast<float>(dy2[di]));
+            a20 = _mm256_fmadd_ps(vx, w0, a20); a21 = _mm256_fmadd_ps(vx, w1, a21);
+            a22 = _mm256_fmadd_ps(vx, w2, a22); a23 = _mm256_fmadd_ps(vx, w3, a23);
+        }
+        if (dy3[di]) {
+            const __m256 vx = _mm256_set1_ps(static_cast<float>(dy3[di]));
+            a30 = _mm256_fmadd_ps(vx, w0, a30); a31 = _mm256_fmadd_ps(vx, w1, a31);
+            a32 = _mm256_fmadd_ps(vx, w2, a32); a33 = _mm256_fmadd_ps(vx, w3, a33);
+        }
+    }
+
+    const __m256 g0 = _mm256_set1_ps(gain0), g1 = _mm256_set1_ps(gain1);
+    const __m256 g2 = _mm256_set1_ps(gain2), g3 = _mm256_set1_ps(gain3);
+
+    __m256 xv = _mm256_loadu_ps(x0 + i0 + 0);
+    xv = _mm256_fmadd_ps(a00, g0, xv);
+    _mm256_storeu_ps(x0 + i0 + 0, xv);
+    xv = _mm256_loadu_ps(x0 + i0 + 8);
+    xv = _mm256_fmadd_ps(a01, g0, xv);
+    _mm256_storeu_ps(x0 + i0 + 8, xv);
+    xv = _mm256_loadu_ps(x0 + i0 + 16);
+    xv = _mm256_fmadd_ps(a02, g0, xv);
+    _mm256_storeu_ps(x0 + i0 + 16, xv);
+    xv = _mm256_loadu_ps(x0 + i0 + 24);
+    xv = _mm256_fmadd_ps(a03, g0, xv);
+    _mm256_storeu_ps(x0 + i0 + 24, xv);
+
+    xv = _mm256_loadu_ps(x1 + i0 + 0);
+    xv = _mm256_fmadd_ps(a10, g1, xv);
+    _mm256_storeu_ps(x1 + i0 + 0, xv);
+    xv = _mm256_loadu_ps(x1 + i0 + 8);
+    xv = _mm256_fmadd_ps(a11, g1, xv);
+    _mm256_storeu_ps(x1 + i0 + 8, xv);
+    xv = _mm256_loadu_ps(x1 + i0 + 16);
+    xv = _mm256_fmadd_ps(a12, g1, xv);
+    _mm256_storeu_ps(x1 + i0 + 16, xv);
+    xv = _mm256_loadu_ps(x1 + i0 + 24);
+    xv = _mm256_fmadd_ps(a13, g1, xv);
+    _mm256_storeu_ps(x1 + i0 + 24, xv);
+
+    xv = _mm256_loadu_ps(x2 + i0 + 0);
+    xv = _mm256_fmadd_ps(a20, g2, xv);
+    _mm256_storeu_ps(x2 + i0 + 0, xv);
+    xv = _mm256_loadu_ps(x2 + i0 + 8);
+    xv = _mm256_fmadd_ps(a21, g2, xv);
+    _mm256_storeu_ps(x2 + i0 + 8, xv);
+    xv = _mm256_loadu_ps(x2 + i0 + 16);
+    xv = _mm256_fmadd_ps(a22, g2, xv);
+    _mm256_storeu_ps(x2 + i0 + 16, xv);
+    xv = _mm256_loadu_ps(x2 + i0 + 24);
+    xv = _mm256_fmadd_ps(a23, g2, xv);
+    _mm256_storeu_ps(x2 + i0 + 24, xv);
+
+    xv = _mm256_loadu_ps(x3 + i0 + 0);
+    xv = _mm256_fmadd_ps(a30, g3, xv);
+    _mm256_storeu_ps(x3 + i0 + 0, xv);
+    xv = _mm256_loadu_ps(x3 + i0 + 8);
+    xv = _mm256_fmadd_ps(a31, g3, xv);
+    _mm256_storeu_ps(x3 + i0 + 8, xv);
+    xv = _mm256_loadu_ps(x3 + i0 + 16);
+    xv = _mm256_fmadd_ps(a32, g3, xv);
+    _mm256_storeu_ps(x3 + i0 + 16, xv);
+    xv = _mm256_loadu_ps(x3 + i0 + 24);
+    xv = _mm256_fmadd_ps(a33, g3, xv);
+    _mm256_storeu_ps(x3 + i0 + 24, xv);
+#else
+    (void)Wt8;
+    (void)stride_cols;
+    (void)j0;
+    (void)hCount;
+    (void)dy0;
+    (void)dy1;
+    (void)dy2;
+    (void)dy3;
+    (void)i0;
+    (void)gain0;
+    (void)gain1;
+    (void)gain2;
+    (void)gain3;
+#endif
+}
+
+inline void dot_ternary_i8_scale_store_block32_x4_bwd_exact_overwrite(
+    float* __restrict x0, float* __restrict x1,
+    float* __restrict x2, float* __restrict x3,
+    const int8_t* __restrict Wt8,
+    std::size_t stride_cols, std::size_t j0, std::size_t hCount,
+    const int8_t* __restrict dy0, const int8_t* __restrict dy1,
+    const int8_t* __restrict dy2, const int8_t* __restrict dy3,
+    std::size_t i0,
+    float gain0, float gain1, float gain2, float gain3)
+{
+#if defined(__AVX2__)
+    __m256 a00 = _mm256_setzero_ps(), a01 = _mm256_setzero_ps(), a02 = _mm256_setzero_ps(), a03 = _mm256_setzero_ps();
+    __m256 a10 = _mm256_setzero_ps(), a11 = _mm256_setzero_ps(), a12 = _mm256_setzero_ps(), a13 = _mm256_setzero_ps();
+    __m256 a20 = _mm256_setzero_ps(), a21 = _mm256_setzero_ps(), a22 = _mm256_setzero_ps(), a23 = _mm256_setzero_ps();
+    __m256 a30 = _mm256_setzero_ps(), a31 = _mm256_setzero_ps(), a32 = _mm256_setzero_ps(), a33 = _mm256_setzero_ps();
+
+    for (std::size_t di = 0; di < hCount; ++di) {
+        if (!(dy0[di] | dy1[di] | dy2[di] | dy3[di])) continue;
+        const int8_t* w = Wt8 + (j0 + di) * stride_cols + i0;
+        _mm_prefetch(reinterpret_cast<const char*>(w + stride_cols), _MM_HINT_T0);
+
+        const __m256 w0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 0))));
+        const __m256 w1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 8))));
+        const __m256 w2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 16))));
+        const __m256 w3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(w + 24))));
+
+        if (dy0[di]) {
+            const __m256 vx = _mm256_set1_ps(static_cast<float>(dy0[di]));
+            a00 = _mm256_fmadd_ps(vx, w0, a00); a01 = _mm256_fmadd_ps(vx, w1, a01);
+            a02 = _mm256_fmadd_ps(vx, w2, a02); a03 = _mm256_fmadd_ps(vx, w3, a03);
+        }
+        if (dy1[di]) {
+            const __m256 vx = _mm256_set1_ps(static_cast<float>(dy1[di]));
+            a10 = _mm256_fmadd_ps(vx, w0, a10); a11 = _mm256_fmadd_ps(vx, w1, a11);
+            a12 = _mm256_fmadd_ps(vx, w2, a12); a13 = _mm256_fmadd_ps(vx, w3, a13);
+        }
+        if (dy2[di]) {
+            const __m256 vx = _mm256_set1_ps(static_cast<float>(dy2[di]));
+            a20 = _mm256_fmadd_ps(vx, w0, a20); a21 = _mm256_fmadd_ps(vx, w1, a21);
+            a22 = _mm256_fmadd_ps(vx, w2, a22); a23 = _mm256_fmadd_ps(vx, w3, a23);
+        }
+        if (dy3[di]) {
+            const __m256 vx = _mm256_set1_ps(static_cast<float>(dy3[di]));
+            a30 = _mm256_fmadd_ps(vx, w0, a30); a31 = _mm256_fmadd_ps(vx, w1, a31);
+            a32 = _mm256_fmadd_ps(vx, w2, a32); a33 = _mm256_fmadd_ps(vx, w3, a33);
+        }
+    }
+
+    const __m256 g0 = _mm256_set1_ps(gain0), g1 = _mm256_set1_ps(gain1);
+    const __m256 g2 = _mm256_set1_ps(gain2), g3 = _mm256_set1_ps(gain3);
+
+    __m256 xv = _mm256_mul_ps(a00, g0);
+    _mm256_storeu_ps(x0 + i0 + 0, xv);
+    xv = _mm256_mul_ps(a01, g0);
+    _mm256_storeu_ps(x0 + i0 + 8, xv);
+    xv = _mm256_mul_ps(a02, g0);
+    _mm256_storeu_ps(x0 + i0 + 16, xv);
+    xv = _mm256_mul_ps(a03, g0);
+    _mm256_storeu_ps(x0 + i0 + 24, xv);
+
+    xv = _mm256_mul_ps(a10, g1);
+    _mm256_storeu_ps(x1 + i0 + 0, xv);
+    xv = _mm256_mul_ps(a11, g1);
+    _mm256_storeu_ps(x1 + i0 + 8, xv);
+    xv = _mm256_mul_ps(a12, g1);
+    _mm256_storeu_ps(x1 + i0 + 16, xv);
+    xv = _mm256_mul_ps(a13, g1);
+    _mm256_storeu_ps(x1 + i0 + 24, xv);
+
+    xv = _mm256_mul_ps(a20, g2);
+    _mm256_storeu_ps(x2 + i0 + 0, xv);
+    xv = _mm256_mul_ps(a21, g2);
+    _mm256_storeu_ps(x2 + i0 + 8, xv);
+    xv = _mm256_mul_ps(a22, g2);
+    _mm256_storeu_ps(x2 + i0 + 16, xv);
+    xv = _mm256_mul_ps(a23, g2);
+    _mm256_storeu_ps(x2 + i0 + 24, xv);
+
+    xv = _mm256_mul_ps(a30, g3);
+    _mm256_storeu_ps(x3 + i0 + 0, xv);
+    xv = _mm256_mul_ps(a31, g3);
+    _mm256_storeu_ps(x3 + i0 + 8, xv);
+    xv = _mm256_mul_ps(a32, g3);
+    _mm256_storeu_ps(x3 + i0 + 16, xv);
+    xv = _mm256_mul_ps(a33, g3);
+    _mm256_storeu_ps(x3 + i0 + 24, xv);
+#else
+    (void)Wt8;
+    (void)stride_cols;
+    (void)j0;
+    (void)hCount;
+    (void)dy0;
+    (void)dy1;
+    (void)dy2;
+    (void)dy3;
+    (void)i0;
+    (void)gain0;
+    (void)gain1;
+    (void)gain2;
+    (void)gain3;
 #endif
 }
 
@@ -2409,40 +2935,40 @@ inline void dot_i2s_i8_scale_store_block32_x4_bwd_exact_overwrite(
     const __m256 g0 = _mm256_set1_ps(gain0), g1 = _mm256_set1_ps(gain1);
     const __m256 g2 = _mm256_set1_ps(gain2), g3 = _mm256_set1_ps(gain3);
 
-    __m256 xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), g0);
+    __m256 xv = _mm256_mul_ps(a00, g0);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), g0);
+    xv = _mm256_mul_ps(a01, g0);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a02)), g0);
+    xv = _mm256_mul_ps(a02, g0);
     _mm256_storeu_ps(x0 + i0 + 16, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a03)), g0);
+    xv = _mm256_mul_ps(a03, g0);
     _mm256_storeu_ps(x0 + i0 + 24, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), g1);
+    xv = _mm256_mul_ps(a10, g1);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), g1);
+    xv = _mm256_mul_ps(a11, g1);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a12)), g1);
+    xv = _mm256_mul_ps(a12, g1);
     _mm256_storeu_ps(x1 + i0 + 16, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a13)), g1);
+    xv = _mm256_mul_ps(a13, g1);
     _mm256_storeu_ps(x1 + i0 + 24, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a20)), g2);
+    xv = _mm256_mul_ps(a20, g2);
     _mm256_storeu_ps(x2 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a21)), g2);
+    xv = _mm256_mul_ps(a21, g2);
     _mm256_storeu_ps(x2 + i0 + 8, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a22)), g2);
+    xv = _mm256_mul_ps(a22, g2);
     _mm256_storeu_ps(x2 + i0 + 16, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a23)), g2);
+    xv = _mm256_mul_ps(a23, g2);
     _mm256_storeu_ps(x2 + i0 + 24, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a30)), g3);
+    xv = _mm256_mul_ps(a30, g3);
     _mm256_storeu_ps(x3 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a31)), g3);
+    xv = _mm256_mul_ps(a31, g3);
     _mm256_storeu_ps(x3 + i0 + 8, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a32)), g3);
+    xv = _mm256_mul_ps(a32, g3);
     _mm256_storeu_ps(x3 + i0 + 16, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a33)), g3);
+    xv = _mm256_mul_ps(a33, g3);
     _mm256_storeu_ps(x3 + i0 + 24, xv);
 #else
     int32_t acc0[32] = { 0 }, acc1[32] = { 0 }, acc2[32] = { 0 }, acc3[32] = { 0 };
@@ -2488,17 +3014,17 @@ inline void dot_i2s_i8_scale_store_block16_x2_bwd_exact(
 
     const __m256 g0 = _mm256_set1_ps(gain0), g1 = _mm256_set1_ps(gain1);
     __m256 xv = _mm256_loadu_ps(x0 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), g0, xv);
+    xv = _mm256_fmadd_ps(a00, g0, xv);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x0 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), g0, xv);
+    xv = _mm256_fmadd_ps(a01, g0, xv);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
     xv = _mm256_loadu_ps(x1 + i0 + 0);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), g1, xv);
+    xv = _mm256_fmadd_ps(a10, g1, xv);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
     xv = _mm256_loadu_ps(x1 + i0 + 8);
-    xv = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), g1, xv);
+    xv = _mm256_fmadd_ps(a11, g1, xv);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 #else
     int32_t acc0[32] = { 0 }, acc1[32] = { 0 };
@@ -2545,14 +3071,14 @@ inline void dot_i2s_i8_scale_store_block16_x2_bwd_exact_overwrite(
     }
 
     const __m256 g0 = _mm256_set1_ps(gain0), g1 = _mm256_set1_ps(gain1);
-    __m256 xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a00)), g0);
+    __m256 xv = _mm256_mul_ps(a00, g0);
     _mm256_storeu_ps(x0 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a01)), g0);
+    xv = _mm256_mul_ps(a01, g0);
     _mm256_storeu_ps(x0 + i0 + 8, xv);
 
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a10)), g1);
+    xv = _mm256_mul_ps(a10, g1);
     _mm256_storeu_ps(x1 + i0 + 0, xv);
-    xv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtps_epi32(a11)), g1);
+    xv = _mm256_mul_ps(a11, g1);
     _mm256_storeu_ps(x1 + i0 + 8, xv);
 #else
     int32_t acc0[32] = { 0 }, acc1[32] = { 0 };

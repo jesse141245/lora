@@ -16,16 +16,17 @@ import gguf
 HF_BF16_MODEL = "microsoft/bitnet-b1.58-2B-4T-bf16"
 HF_GGUF_MODEL = "microsoft/bitnet-b1.58-2B-4T-gguf"
 
-INPUT_JSONL   = "my_raw_data.jsonl"
-TOKENIZED_OUT = "./test_dataset.jsonl"
+INPUT_JSONL   = os.getenv("QLORA_RAW_JSONL", "my_raw_data.jsonl")
+TOKENIZED_OUT = os.getenv("QLORA_TOKENIZED_OUT", "./test_dataset.jsonl")
 MODEL_DIR     = "./test_model"
 WEIGHTS_DIR   = f"{MODEL_DIR}/weights"
 
 CPP_TRAINER_EXE = os.path.abspath("x64/Release/qlora_test.exe")
 LORA_RAW_BIN    = os.path.abspath("./lora_output.bin")
 LORA_GGUF_OUT   = os.path.abspath("./bitnet_adapter.gguf")
+PISSA_PATH      = os.getenv("QLORA_PISSA_PATH", os.getenv("QLORA_TEST_PISSA_PATH", ""))
 
-MAX_SEQ_LEN = 256  # must match cfg.maxSeqLen in main.cpp
+MAX_SEQ_LEN = int(os.getenv("QLORA_MAX_SEQ_LEN", "256"))  # must match trainer maxSeqLen
 IGNORE_IDX  = -100
 
 # ==============================================================================
@@ -256,6 +257,7 @@ def convert_lora_to_gguf(base_gguf_path):
 
     with open(f"{MODEL_DIR}/config.json", "r") as f: cfg = json.load(f)
     H, n_head = int(cfg["hidden_size"]), int(cfg["num_attention_heads"])
+    ffn_dim = int(cfg["intermediate_size"])
     kv_dim = int(cfg["num_key_value_heads"]) * int(cfg["head_dim"])
 
     exact_arch = get_exact_base_architecture(base_gguf_path)
@@ -270,22 +272,133 @@ def convert_lora_to_gguf(base_gguf_path):
         
         writer = gguf.GGUFWriter(LORA_GGUF_OUT, exact_arch)
         writer.add_string("general.type", "adapter")
-        writer.add_string("adapter.type", "lora")
-        writer.add_float32("adapter.lora.alpha", float(alpha))
+        has_dora = bool(flags & 2048)
+        has_pissa = bool(flags & 4096)
+        pissa_path = PISSA_PATH
+        if has_pissa and not pissa_path:
+            raise ValueError("PiSSA adapter requires QLORA_PISSA_PATH/QLORA_TEST_PISSA_PATH for normal-base GGUF export")
+        if has_pissa:
+            writer.add_bool("adapter.pissa_delta_export", True)
+        writer.add_string("adapter.type", "dora" if has_dora else "lora")
+        # A PiSSA normal-base export represents:
+        #   scale * (A_final.T @ B_final - A_init.T @ B_init)
+        # as a rank-doubled LoRA pair. Keep the effective scale alpha/R by
+        # doubling alpha when rank doubles.
+        writer.add_float32("adapter.lora.alpha", float(alpha * 2.0 if has_pissa else alpha))
+        if has_dora:
+            writer.add_bool("adapter.dora", True)
+
+        def pissa_stem(layer, name):
+            if layer is None:
+                return os.path.join(pissa_path, name)
+            return os.path.join(pissa_path, f"layer_{layer}_{name}")
+
+        def maybe_pissa_delta(layer, name, a, b):
+            if not has_pissa:
+                return a, b
+            stem = pissa_stem(layer, name)
+            a_path = stem + ".A.bin"
+            b_path = stem + ".B.bin"
+            if not (os.path.exists(a_path) or os.path.exists(b_path)):
+                return a, b
+            if not (os.path.exists(a_path) and os.path.exists(b_path)):
+                raise ValueError(f"Incomplete PiSSA init factors for {stem}")
+            a0 = np.fromfile(a_path, dtype=np.float32).reshape(a.shape)
+            b0 = np.fromfile(b_path, dtype=np.float32).reshape(b.shape)
+            return np.concatenate([a, a0], axis=0), np.concatenate([b, -b0], axis=1)
 
         for L in range(nL):
             if flags & 1: # Q_PROJ
                 a = np.fromfile(f, dtype=np.float32, count=R * H).reshape((R, H))
                 b = np.fromfile(f, dtype=np.float32, count=H * R).reshape((H, R))
+                a, b = maybe_pissa_delta(L, "Wq", a, b)
                 writer.add_tensor(f"blk.{L}.attn_q.weight.lora_a", a)
                 writer.add_tensor(f"blk.{L}.attn_q.weight.lora_b", b)
+                if has_dora:
+                    writer.add_tensor(f"blk.{L}.attn_q.weight.dora_magnitude", np.fromfile(f, dtype=np.float32, count=H))
+
+            if flags & 2: # K_PROJ
+                a = np.fromfile(f, dtype=np.float32, count=R * H).reshape((R, H))
+                b = np.fromfile(f, dtype=np.float32, count=kv_dim * R).reshape((kv_dim, R))
+                a, b = maybe_pissa_delta(L, "Wk", a, b)
+                writer.add_tensor(f"blk.{L}.attn_k.weight.lora_a", a)
+                writer.add_tensor(f"blk.{L}.attn_k.weight.lora_b", b)
+                if has_dora:
+                    writer.add_tensor(f"blk.{L}.attn_k.weight.dora_magnitude", np.fromfile(f, dtype=np.float32, count=kv_dim))
 
             if flags & 4: # V_PROJ
                 a = np.fromfile(f, dtype=np.float32, count=R * H).reshape((R, H))
                 # GQA nuance: V projection output is kv_dim (n_kv_heads * head_dim), not H.
                 b = np.fromfile(f, dtype=np.float32, count=kv_dim * R).reshape((kv_dim, R))
+                a, b = maybe_pissa_delta(L, "Wv", a, b)
                 writer.add_tensor(f"blk.{L}.attn_v.weight.lora_a", a)
                 writer.add_tensor(f"blk.{L}.attn_v.weight.lora_b", b)
+                if has_dora:
+                    writer.add_tensor(f"blk.{L}.attn_v.weight.dora_magnitude", np.fromfile(f, dtype=np.float32, count=kv_dim))
+
+            if flags & 8: # O_PROJ
+                a = np.fromfile(f, dtype=np.float32, count=R * H).reshape((R, H))
+                b = np.fromfile(f, dtype=np.float32, count=H * R).reshape((H, R))
+                a, b = maybe_pissa_delta(L, "Wo", a, b)
+                writer.add_tensor(f"blk.{L}.attn_output.weight.lora_a", a)
+                writer.add_tensor(f"blk.{L}.attn_output.weight.lora_b", b)
+                if has_dora:
+                    writer.add_tensor(f"blk.{L}.attn_output.weight.dora_magnitude", np.fromfile(f, dtype=np.float32, count=H))
+
+            if flags & 16: # FFN_DOWN
+                a = np.fromfile(f, dtype=np.float32, count=R * ffn_dim).reshape((R, ffn_dim))
+                b = np.fromfile(f, dtype=np.float32, count=H * R).reshape((H, R))
+                a, b = maybe_pissa_delta(L, "Wdown", a, b)
+                writer.add_tensor(f"blk.{L}.ffn_down.weight.lora_a", a)
+                writer.add_tensor(f"blk.{L}.ffn_down.weight.lora_b", b)
+                if has_dora:
+                    writer.add_tensor(f"blk.{L}.ffn_down.weight.dora_magnitude", np.fromfile(f, dtype=np.float32, count=H))
+
+            if flags & 64: # FFN_GATE_UP
+                a = np.fromfile(f, dtype=np.float32, count=R * H).reshape((R, H))
+                b = np.fromfile(f, dtype=np.float32, count=ffn_dim * R).reshape((ffn_dim, R))
+                a, b = maybe_pissa_delta(L, "Wgate", a, b)
+                writer.add_tensor(f"blk.{L}.ffn_gate.weight.lora_a", a)
+                writer.add_tensor(f"blk.{L}.ffn_gate.weight.lora_b", b)
+                if has_dora:
+                    writer.add_tensor(f"blk.{L}.ffn_gate.weight.dora_magnitude", np.fromfile(f, dtype=np.float32, count=ffn_dim))
+
+                a = np.fromfile(f, dtype=np.float32, count=R * H).reshape((R, H))
+                b = np.fromfile(f, dtype=np.float32, count=ffn_dim * R).reshape((ffn_dim, R))
+                a, b = maybe_pissa_delta(L, "Wup", a, b)
+                writer.add_tensor(f"blk.{L}.ffn_up.weight.lora_a", a)
+                writer.add_tensor(f"blk.{L}.ffn_up.weight.lora_b", b)
+                if has_dora:
+                    writer.add_tensor(f"blk.{L}.ffn_up.weight.dora_magnitude", np.fromfile(f, dtype=np.float32, count=ffn_dim))
+
+            if flags & 512: # LAYER_RMSNORM
+                attn_norm = np.fromfile(f, dtype=np.float32, count=H)
+                ffn_norm = np.fromfile(f, dtype=np.float32, count=H)
+                writer.add_tensor(f"blk.{L}.attn_norm.weight", attn_norm)
+                writer.add_tensor(f"blk.{L}.ffn_norm.weight", ffn_norm)
+
+        if flags & 32: # LM_HEAD
+            a = np.fromfile(f, dtype=np.float32, count=R * H).reshape((R, H))
+            b = np.fromfile(f, dtype=np.float32, count=int(cfg["vocab_size"]) * R).reshape((int(cfg["vocab_size"]), R))
+            a, b = maybe_pissa_delta(None, "W_out", a, b)
+            writer.add_tensor("output.weight.lora_a", a)
+            writer.add_tensor("output.weight.lora_b", b)
+            if has_dora:
+                writer.add_tensor("output.weight.dora_magnitude", np.fromfile(f, dtype=np.float32, count=int(cfg["vocab_size"])))
+
+        if flags & 128: # LM_HEAD_BIAS
+            bias = np.fromfile(f, dtype=np.float32, count=int(cfg["vocab_size"]))
+            writer.add_tensor("output.bias", bias)
+
+        if flags & 256: # FINAL_NORM_AFFINE
+            scale = np.fromfile(f, dtype=np.float32, count=H)
+            bias = np.fromfile(f, dtype=np.float32, count=H)
+            writer.add_tensor("output_norm.weight", scale)
+            writer.add_tensor("output_norm.bias", bias)
+
+        if flags & 1024: # FINAL_RMSNORM
+            norm = np.fromfile(f, dtype=np.float32, count=H)
+            writer.add_tensor("output_norm.weight", norm)
 
         writer.write_header_to_file()
         writer.write_kv_data_to_file()

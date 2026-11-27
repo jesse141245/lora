@@ -82,7 +82,7 @@ void quantize_ternary_blockwise(
 // W is [H x H] row-major.
 //
 // Scale layout:
-//   w_scale_tile[jb * nKBlocks + kb]
+//   out.forwardScaleIndex(jb, kb)
 //
 // where:
 //   kb = input-row tile index   (tile height = qk)
@@ -123,6 +123,7 @@ void quantize_ternary_i2s_blockwise(
     out.hadamard32 = hadamard32;
     out.qk = qk;
     out.jq = jq;
+    out.scaleLayout = BitNetI2SScaleLayout::JMajorBroadcastRows;
     out.q2.clear();
     out.w_scale_tile.assign(nJBlocks * nKBlocks, 1.0f);
 
@@ -164,7 +165,7 @@ void quantize_ternary_i2s_blockwise(
                 }
 
                 const float s = (amax > 0.0f) ? amax : 1.0f;
-                out.w_scale_tile[jb * nKBlocks + kb] = s;
+                out.w_scale_tile[out.forwardScaleIndex(jb, kb)] = s;
                 const float inv_s = 1.0f / s;
 
                 for (std::size_t rowLocal = 0; rowLocal < tileRows; ++rowLocal) {
@@ -183,7 +184,7 @@ void quantize_ternary_i2s_blockwise(
                 }
 
                 const float s = (amax > 0.0f) ? amax : 1.0f;
-                out.w_scale_tile[jb * nKBlocks + kb] = s;
+                out.w_scale_tile[out.forwardScaleIndex(jb, kb)] = s;
                 const float inv_s = 1.0f / s;
 
                 for (std::size_t i = i0; i < i1; ++i) {

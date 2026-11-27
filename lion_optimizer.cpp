@@ -8,6 +8,9 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace {
 
@@ -22,6 +25,18 @@ namespace {
         shuf = _mm_movehl_ps(shuf, sums);
         sums = _mm_add_ss(sums, shuf);
         return _mm_cvtss_f32(sums);
+    }
+
+    inline __m256 fmadd_ps(__m256 a, __m256 b, __m256 c) {
+#if defined(__FMA__)
+        return _mm256_fmadd_ps(a, b, c);
+#else
+        return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+#endif
+    }
+
+    inline __m256 copy_sign_ps(__m256 magnitude, __m256 sign_source, __m256 signmask) {
+        return _mm256_or_ps(magnitude, _mm256_and_ps(sign_source, signmask));
     }
 #endif
 
@@ -57,7 +72,12 @@ void LionOptimizer::clipGradNorm(const std::vector<ParamRef>& params, float maxN
 
     double ss = 0.0;
 
-    for (const auto& p : params) {
+    const ptrdiff_t paramCount = static_cast<ptrdiff_t>(params.size());
+#if defined(_OPENMP)
+#pragma omp parallel for reduction(+:ss) schedule(static) if(paramCount > 1)
+#endif
+    for (ptrdiff_t pIdx = 0; pIdx < paramCount; ++pIdx) {
+        const auto& p = params[static_cast<std::size_t>(pIdx)];
         const float* g = p.g;
         const std::size_t n = p.n;
 
@@ -89,7 +109,12 @@ void LionOptimizer::clipGradNorm(const std::vector<ParamRef>& params, float maxN
 
     const float scale = static_cast<float>(static_cast<double>(maxNorm) / norm);
 
-    for (const auto& p : params) {
+    const ptrdiff_t scaleParamCount = static_cast<ptrdiff_t>(params.size());
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(scaleParamCount > 1)
+#endif
+    for (ptrdiff_t pIdx = 0; pIdx < scaleParamCount; ++pIdx) {
+        const auto& p = params[static_cast<std::size_t>(pIdx)];
         float* g = p.g;
         const std::size_t n = p.n;
 
@@ -120,14 +145,18 @@ void LionOptimizer::step(const std::vector<ParamRef>& params, bool zeroGrads)
         throw std::runtime_error("LionOptimizer::step: params size changed; call init() again");
     }
 
-    // FIX: Use |lr| so the sign-OR trick in AVX2 is always correct,
-    // even if a caller accidentally passes a negative learning rate.
     const float lr_abs = std::abs(lr_);
 
-    for (std::size_t k = 0; k < params.size(); ++k) {
+    const ptrdiff_t paramCount = static_cast<ptrdiff_t>(params.size());
+#if defined(_OPENMP)
+#pragma omp parallel for schedule(static) if(paramCount > 1)
+#endif
+    for (ptrdiff_t k_i = 0; k_i < paramCount; ++k_i) {
+        const std::size_t k = static_cast<std::size_t>(k_i);
         float* w = params[k].w;
         float* g = params[k].g;
         auto& m = m_[k];
+        const float param_lr_abs = lr_abs * params[k].lrScale;
 
         const std::size_t n = params[k].n;
         if (m.size() != n) {
@@ -135,86 +164,200 @@ void LionOptimizer::step(const std::vector<ParamRef>& params, bool zeroGrads)
         }
 
 #if defined(__AVX2__)
+        float* const mPtr = m.data();
         const __m256 beta1v = _mm256_set1_ps(beta1_);
         const __m256 one_mb1v = _mm256_set1_ps(1.0f - beta1_);
         const __m256 beta2v = _mm256_set1_ps(beta2_);
         const __m256 one_mb2v = _mm256_set1_ps(1.0f - beta2_);
-        const __m256 wdv = _mm256_set1_ps(weightDecay_);
-        const __m256 lrv = _mm256_set1_ps(lr_abs);  // always positive magnitude
-
-        // Mask that isolates the IEEE-754 sign bit of each float lane.
+        const __m256 lrv = _mm256_set1_ps(param_lr_abs);
+        const __m256 zerov = _mm256_setzero_ps();
+        const bool useWeightDecay = weightDecay_ != 0.0f;
         const __m256 signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x80000000));
+        const __m256 decayv = _mm256_set1_ps(1.0f - (param_lr_abs * weightDecay_));
 
         std::size_t i = 0;
-        for (; i + 8 <= n; i += 8) {
-            __m256 wv = _mm256_loadu_ps(w + i);
-            __m256 gv = _mm256_loadu_ps(g + i);
-            __m256 mv = _mm256_loadu_ps(m.data() + i);  // m_old
-
-            // ── 1. Weight-decayed gradient ───────────────────────────────────
-            // grad = g + weightDecay * w
-#if defined(__FMA__)
-            __m256 grad = _mm256_fmadd_ps(wdv, wv, gv);
-#else
-            __m256 grad = _mm256_add_ps(gv, _mm256_mul_ps(wdv, wv));
-#endif
-
-            // ── 2. FIX: compute u from m_OLD, THEN update m ──────────────────
-            //
-            // Lion paper Algorithm 1 (Chen et al., 2023):
-            //   Line 6:  u = β2·m + (1−β2)·grad       ← uses m BEFORE update
-            //   Line 7:  m ← β1·m + (1−β1)·grad       ← update happens AFTER
-            //   Line 8:  w ← w − lr·sign(u)
-            //
-            // The old code updated mv first then computed uv from the new mv,
-            // introducing a one-step lag that made the optimizer less stable.
-
-            // u = β2·m_old + (1−β2)·grad
-            __m256 uv = _mm256_add_ps(
-                _mm256_mul_ps(beta2v, mv),
-                _mm256_mul_ps(one_mb2v, grad)
-            );
-
-            // m ← β1·m_old + (1−β1)·grad
-            mv = _mm256_add_ps(
-                _mm256_mul_ps(beta1v, mv),
-                _mm256_mul_ps(one_mb1v, grad)
-            );
-            _mm256_storeu_ps(m.data() + i, mv);
-
-            // ── 3. Weight update: w -= copysign(|lr|, u) ────────────────────
-            // Extract sign bit from u and OR it onto the positive lr magnitude.
-            __m256 signbits = _mm256_and_ps(uv, signmask);
-            __m256 stepv = _mm256_or_ps(lrv, signbits);
-
-            wv = _mm256_sub_ps(wv, stepv);
-            _mm256_storeu_ps(w + i, wv);
-
-            if (zeroGrads) {
-                _mm256_storeu_ps(g + i, _mm256_setzero_ps());
+        if (zeroGrads) {
+            for (; i + 8 <= n; i += 8) {
+                __m256 wv = _mm256_loadu_ps(w + i);
+                const __m256 gv = _mm256_loadu_ps(g + i);
+                const __m256 mv = _mm256_loadu_ps(mPtr + i);
+                const __m256 updatev = fmadd_ps(one_mb1v, gv, _mm256_mul_ps(beta1v, mv));
+                const __m256 newMv = fmadd_ps(one_mb2v, gv, _mm256_mul_ps(beta2v, mv));
+                if (useWeightDecay) {
+                    wv = _mm256_mul_ps(wv, decayv);
+                }
+                const __m256 stepv = copy_sign_ps(lrv, updatev, signmask);
+                wv = _mm256_sub_ps(wv, stepv);
+                _mm256_storeu_ps(w + i, wv);
+                _mm256_storeu_ps(mPtr + i, newMv);
+                _mm256_storeu_ps(g + i, zerov);
+            }
+        }
+        else {
+            for (; i + 8 <= n; i += 8) {
+                __m256 wv = _mm256_loadu_ps(w + i);
+                const __m256 gv = _mm256_loadu_ps(g + i);
+                const __m256 mv = _mm256_loadu_ps(mPtr + i);
+                const __m256 updatev = fmadd_ps(one_mb1v, gv, _mm256_mul_ps(beta1v, mv));
+                const __m256 newMv = fmadd_ps(one_mb2v, gv, _mm256_mul_ps(beta2v, mv));
+                if (useWeightDecay) {
+                    wv = _mm256_mul_ps(wv, decayv);
+                }
+                const __m256 stepv = copy_sign_ps(lrv, updatev, signmask);
+                wv = _mm256_sub_ps(wv, stepv);
+                _mm256_storeu_ps(w + i, wv);
+                _mm256_storeu_ps(mPtr + i, newMv);
             }
         }
 
-        // ── Scalar tail (handles n % 8 remainder) ───────────────────────────
-        for (; i < n; ++i) {
-            const float grad = g[i] + weightDecay_ * w[i];
-            // u uses m_old — same order as AVX2 path above
-            const float u = beta2_ * m[i] + (1.0f - beta2_) * grad;
-            m[i] = beta1_ * m[i] + (1.0f - beta1_) * grad;
-            w[i] -= std::copysign(lr_abs, u);
-            if (zeroGrads) g[i] = 0.0f;
+        if (useWeightDecay) {
+            const float decay = 1.0f - (param_lr_abs * weightDecay_);
+            for (; i < n; ++i) {
+                const float grad = g[i];
+                const float update = beta1_ * m[i] + (1.0f - beta1_) * grad;
+                w[i] *= decay;
+                w[i] -= std::copysign(param_lr_abs, update);
+                m[i] = beta2_ * m[i] + (1.0f - beta2_) * grad;
+                if (zeroGrads) g[i] = 0.0f;
+            }
+        }
+        else {
+            for (; i < n; ++i) {
+                const float grad = g[i];
+                const float update = beta1_ * m[i] + (1.0f - beta1_) * grad;
+                w[i] -= std::copysign(param_lr_abs, update);
+                m[i] = beta2_ * m[i] + (1.0f - beta2_) * grad;
+                if (zeroGrads) g[i] = 0.0f;
+            }
         }
 
-#else  // ── Pure scalar fallback (no AVX2) ───────────────────────────────────
-
-        for (std::size_t i = 0; i < n; ++i) {
-            const float grad = g[i] + weightDecay_ * w[i];
-            // u uses m_old
-            const float u = beta2_ * m[i] + (1.0f - beta2_) * grad;
-            m[i] = beta1_ * m[i] + (1.0f - beta1_) * grad;
-            w[i] -= std::copysign(lr_abs, u);
-            if (zeroGrads) g[i] = 0.0f;
+#else
+        if (weightDecay_ != 0.0f) {
+            const float decay = 1.0f - (param_lr_abs * weightDecay_);
+            for (std::size_t i = 0; i < n; ++i) {
+                const float grad = g[i];
+                const float update = beta1_ * m[i] + (1.0f - beta1_) * grad;
+                w[i] *= decay;
+                w[i] -= std::copysign(param_lr_abs, update);
+                m[i] = beta2_ * m[i] + (1.0f - beta2_) * grad;
+                if (zeroGrads) g[i] = 0.0f;
+            }
+        }
+        else {
+            for (std::size_t i = 0; i < n; ++i) {
+                const float grad = g[i];
+                const float update = beta1_ * m[i] + (1.0f - beta1_) * grad;
+                w[i] -= std::copysign(param_lr_abs, update);
+                m[i] = beta2_ * m[i] + (1.0f - beta2_) * grad;
+                if (zeroGrads) g[i] = 0.0f;
+            }
         }
 #endif
     }
+}
+
+void LionOptimizer::zeroState()
+{
+    for (auto& buf : m_) {
+        std::fill(buf.begin(), buf.end(), 0.0f);
+    }
+    std::fill(mFlat_.begin(), mFlat_.end(), 0.0f);
+}
+
+void LionOptimizer::step(std::span<float> params, std::span<float> grads)
+{
+    if (params.size() != grads.size()) {
+        throw std::runtime_error("LionOptimizer::step: params/grads size mismatch");
+    }
+    if (params.empty()) return;
+
+    if (mFlat_.size() != params.size()) {
+        mFlat_.assign(params.size(), 0.0f);
+    }
+
+    const float lr_abs = std::abs(lr_);
+    const std::size_t n = params.size();
+    float* const w = params.data();
+    float* const g = grads.data();
+    float* const m = mFlat_.data();
+
+#if defined(__AVX2__)
+    const __m256 beta1v = _mm256_set1_ps(beta1_);
+    const __m256 one_mb1v = _mm256_set1_ps(1.0f - beta1_);
+    const __m256 beta2v = _mm256_set1_ps(beta2_);
+    const __m256 one_mb2v = _mm256_set1_ps(1.0f - beta2_);
+    const __m256 lrv = _mm256_set1_ps(lr_abs);
+    const __m256 zerov = _mm256_setzero_ps();
+    const bool useWeightDecay = weightDecay_ != 0.0f;
+    const __m256 signmask = _mm256_castsi256_ps(_mm256_set1_epi32(0x80000000));
+    const __m256 decayv = _mm256_set1_ps(1.0f - (lr_abs * weightDecay_));
+
+    std::size_t i = 0;
+    if (useWeightDecay) {
+        for (; i + 8 <= n; i += 8) {
+            __m256 wv = _mm256_loadu_ps(w + i);
+            const __m256 gv = _mm256_loadu_ps(g + i);
+            const __m256 mv = _mm256_loadu_ps(m + i);
+            const __m256 updatev = fmadd_ps(one_mb1v, gv, _mm256_mul_ps(beta1v, mv));
+            const __m256 newMv = fmadd_ps(one_mb2v, gv, _mm256_mul_ps(beta2v, mv));
+            wv = _mm256_mul_ps(wv, decayv);
+            const __m256 stepv = copy_sign_ps(lrv, updatev, signmask);
+            wv = _mm256_sub_ps(wv, stepv);
+            _mm256_storeu_ps(w + i, wv);
+            _mm256_storeu_ps(m + i, newMv);
+            _mm256_storeu_ps(g + i, zerov);
+        }
+        const float decay = 1.0f - (lr_abs * weightDecay_);
+        for (; i < n; ++i) {
+            const float grad = g[i];
+            const float update = beta1_ * m[i] + (1.0f - beta1_) * grad;
+            w[i] *= decay;
+            w[i] -= std::copysign(lr_abs, update);
+            m[i] = beta2_ * m[i] + (1.0f - beta2_) * grad;
+            g[i] = 0.0f;
+        }
+    }
+    else {
+        for (; i + 8 <= n; i += 8) {
+            __m256 wv = _mm256_loadu_ps(w + i);
+            const __m256 gv = _mm256_loadu_ps(g + i);
+            const __m256 mv = _mm256_loadu_ps(m + i);
+            const __m256 updatev = fmadd_ps(one_mb1v, gv, _mm256_mul_ps(beta1v, mv));
+            const __m256 newMv = fmadd_ps(one_mb2v, gv, _mm256_mul_ps(beta2v, mv));
+            const __m256 stepv = copy_sign_ps(lrv, updatev, signmask);
+            wv = _mm256_sub_ps(wv, stepv);
+            _mm256_storeu_ps(w + i, wv);
+            _mm256_storeu_ps(m + i, newMv);
+            _mm256_storeu_ps(g + i, zerov);
+        }
+        for (; i < n; ++i) {
+            const float grad = g[i];
+            const float update = beta1_ * m[i] + (1.0f - beta1_) * grad;
+            w[i] -= std::copysign(lr_abs, update);
+            m[i] = beta2_ * m[i] + (1.0f - beta2_) * grad;
+            g[i] = 0.0f;
+        }
+    }
+#else
+    if (weightDecay_ != 0.0f) {
+        const float decay = 1.0f - (lr_abs * weightDecay_);
+        for (std::size_t i = 0; i < n; ++i) {
+            const float grad = g[i];
+            const float update = beta1_ * m[i] + (1.0f - beta1_) * grad;
+            w[i] *= decay;
+            w[i] -= std::copysign(lr_abs, update);
+            m[i] = beta2_ * m[i] + (1.0f - beta2_) * grad;
+            g[i] = 0.0f;
+        }
+    }
+    else {
+        for (std::size_t i = 0; i < n; ++i) {
+            const float grad = g[i];
+            const float update = beta1_ * m[i] + (1.0f - beta1_) * grad;
+            w[i] -= std::copysign(lr_abs, update);
+            m[i] = beta2_ * m[i] + (1.0f - beta2_) * grad;
+            g[i] = 0.0f;
+        }
+    }
+#endif
 }

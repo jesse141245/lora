@@ -76,6 +76,7 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Label="Vcpkg">
     <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgXUseBuiltInApplocalDeps>true</VcpkgXUseBuiltInApplocalDeps>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
@@ -134,7 +135,7 @@
       <FloatingPointModel>Fast</FloatingPointModel>
       <OpenMPSupport>true</OpenMPSupport>
       <AdditionalIncludeDirectories>$(ProjectDir)external\json\include;$(ProjectDir)BitNet\include;$(ProjectDir)BitNet\3rdparty\llama.cpp\ggml\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
-      <AdditionalOptions> /openmp /fp:fast /clang:-O3 /clang:-ffast-math /clang:-march=znver4</AdditionalOptions>
+      <AdditionalOptions> /openmp /fp:fast /clang:-O3 /clang:-ffast-math /clang:-march=x86-64-v3</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -149,6 +150,8 @@
       <ObjectFileName>$(IntDir)adamw_optimizer_adamw.obj</ObjectFileName>
     </ClCompile>
     <ClCompile Include="attention.cpp" />
+    <ClCompile Include="backend_runtime_policy_builder.cpp" />
+    <ClCompile Include="backend_runtime_policy_json.cpp" />
     <ClCompile Include="bitnet_i2s_matmul.cpp" />
     <ClCompile Include="bitnet_tl2_generated.cpp" />
     <ClCompile Include="bitnet_tl2_matmul.cpp" />
@@ -160,6 +163,8 @@
     <ClCompile Include="dataset.cpp" />
     <ClCompile Include="kernels.cpp" />
     <ClCompile Include="lion_optimizer.cpp" />
+    <ClCompile Include="muon_optimizer.cpp" />
+    <ClCompile Include="lora.cpp" />
     <ClCompile Include="lora_io.cpp" />
     <ClCompile Include="loss_ce.cpp" />
     <ClCompile Include="main.cpp" />
@@ -170,6 +175,9 @@
   <ItemGroup>
     <ClInclude Include="adamw_optimizer.h" />
     <ClInclude Include="attention.h" />
+    <ClInclude Include="backend_runtime_policy.h" />
+    <ClInclude Include="backend_runtime_policy_builder.h" />
+    <ClInclude Include="backend_runtime_policy_json.h" />
     <ClInclude Include="bitnet_i2s_matmul.h" />
     <ClInclude Include="bitnet_tl2_generated.h" />
     <ClInclude Include="bitnet_tl2_matmul.h" />
@@ -184,6 +192,8 @@
     <ClInclude Include="dataset.h" />
     <ClInclude Include="kernels.h" />
     <ClInclude Include="lion_optimizer.h" />
+    <ClInclude Include="muon_optimizer.h" />
+    <ClInclude Include="lora.h" />
     <ClInclude Include="lora_io.h" />
     <ClInclude Include="lora_type.h" />
     <ClInclude Include="loss_ce.h" />

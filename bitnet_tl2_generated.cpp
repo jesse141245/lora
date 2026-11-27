@@ -1,10 +1,9 @@
 #include "bitnet_tl2_generated.h"
+#include "env_utils.h"
 
-#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -47,37 +46,24 @@ enum class Tl2ScaleMode {
     PerTile,
 };
 
-std::optional<std::string> tryGetEnvString(const char* name) {
-    const char* value = std::getenv(name);
-    if (!value || *value == '\0') return std::nullopt;
-    return std::string(value);
-}
-
-std::string lowerCopy(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return s;
-}
-
 std::optional<std::string> scopedTl2Env(const char* scope, const char* suffix) {
     if (scope && *scope) {
         std::string scoped = "QLORA_TEST_BITNET_TL2_";
         scoped += scope;
         scoped += "_";
         scoped += suffix;
-        if (auto value = tryGetEnvString(scoped.c_str())) {
+        if (auto value = envutil::tryGetEnvString(scoped.c_str())) {
             return value;
         }
     }
     std::string global = "QLORA_TEST_BITNET_TL2_";
     global += suffix;
-    return tryGetEnvString(global.c_str());
+    return envutil::tryGetEnvString(global.c_str());
 }
 
 Tl2QuantMode parseTl2QuantMode(const std::optional<std::string>& value) {
     if (!value) return Tl2QuantMode::MeanAbs;
-    const std::string s = lowerCopy(*value);
+    const std::string s = envutil::lowerCopy(*value);
     if (s == "absmax" || s == "max") return Tl2QuantMode::AbsMax;
     if (s == "hybrid" || s == "best" || s == "auto") return Tl2QuantMode::Hybrid;
     if (s == "refit" || s == "lsq") return Tl2QuantMode::Refit;
@@ -86,16 +72,16 @@ Tl2QuantMode parseTl2QuantMode(const std::optional<std::string>& value) {
 
 Tl2ScaleMode parseTl2ScaleMode(const std::optional<std::string>& value, Tl2ScaleMode fallback) {
     if (!value) return fallback;
-    const std::string s = lowerCopy(*value);
+    const std::string s = envutil::lowerCopy(*value);
     if (s == "per_tile" || s == "tile" || s == "block") return Tl2ScaleMode::PerTile;
     return Tl2ScaleMode::Global;
 }
 
 bool parseBoolString(const std::optional<std::string>& value, bool fallback) {
     if (!value) return fallback;
-    const std::string s = lowerCopy(*value);
-    if (s == "1" || s == "true" || s == "yes" || s == "on") return true;
-    if (s == "0" || s == "false" || s == "no" || s == "off") return false;
+    const std::string s = envutil::lowerCopy(*value);
+    if (envutil::envStringTruthy(s)) return true;
+    if (envutil::envStringFalsy(s)) return false;
     return fallback;
 }
 
@@ -562,6 +548,7 @@ void build_dense_tile_residual(
     out.denseResidualWeights.assign(nTileNum * slotsPerTile * bm, 0.0f);
 
     std::vector<std::pair<float, std::size_t>> norms(rows);
+    for (std::size_t tile = 0; tile < nTileNum; ++tile) {
         const std::size_t m0 = tile * bm;
         for (std::size_t r = 0; r < rows; ++r) {
             const float* src = residual.data() + r * cols + m0;
@@ -899,4 +886,114 @@ void linear_forward_bitnet_tl2_generated(
             x8Scratch.data(),
             xScaleScratch.data());
     }
+}
+
+void linear_forward_bitnet_tl2_generated_residual_only(
+    float* __restrict Y,
+    const float* __restrict X,
+    const BitNetMatTL2Gen& W,
+    std::size_t T)
+{
+    if (!Y || !X || W.empty() || T == 0) {
+        throw std::runtime_error("linear_forward_bitnet_tl2_generated_residual_only: invalid input");
+    }
+
+    if (!W.i2sResidualStage.empty()) {
+        const std::size_t tTile = 2;
+        const std::size_t nKBlocks = W.i2sResidualStage.nKBlocks();
+        thread_local std::vector<int8_t> x8Scratch;
+        thread_local std::vector<float> xScaleScratch;
+        x8Scratch.resize(tTile * W.rows);
+        xScaleScratch.resize(tTile * nKBlocks);
+        linear_forward_bitnet_i2s_accum(
+            Y,
+            X,
+            W.i2sResidualStage,
+            T,
+            tTile,
+            x8Scratch.data(),
+            xScaleScratch.data());
+    }
+    else if (W.hasResidual()) {
+        const int m = static_cast<int>(W.cols);
+        const int threeK = static_cast<int>(W.threeK);
+        const int twoK = static_cast<int>(W.twoK);
+
+        std::vector<int8_t> threeQLut(std::max<std::size_t>(1, T * (W.threeK / 3) * 32));
+        std::vector<int8_t> twoQLut(std::max<std::size_t>(1, T * (W.twoK / 2) * 32));
+        std::vector<float> lutScales(T, 0.0f);
+
+        ggml_preprocessor(
+            static_cast<int>(T),
+            m,
+            threeK,
+            twoK,
+            const_cast<float*>(X),
+            lutScales.data(),
+            threeQLut.data(),
+            twoQLut.data());
+        tl2_generated_stage_forward(
+            Y,
+            W,
+            W.residualQweights.data(),
+            W.residualTileScales.empty() ? nullptr : W.residualTileScales.data(),
+            W.residualScale,
+            threeQLut,
+            twoQLut,
+            lutScales,
+            T);
+    }
+
+    if (W.denseResidualRowsPerTile != 0 && !W.denseResidualWeights.empty() && !W.denseResidualRowIdx.empty()) {
+        const std::size_t rowsPerTile = W.denseResidualRowsPerTile;
+        const std::size_t bm = W.bm;
+        for (std::size_t t = 0; t < T; ++t) {
+            const float* xRow = X + t * W.rows;
+            float* yRow = Y + t * W.cols;
+            for (std::size_t tile = 0; tile < W.nTileNum; ++tile) {
+                float* yTile = yRow + tile * bm;
+                for (std::size_t s = 0; s < rowsPerTile; ++s) {
+                    const uint16_t rowIdx = W.denseResidualRowIdx[tile * rowsPerTile + s];
+                    if (rowIdx == 0xffffu || rowIdx >= W.rows) {
+                        continue;
+                    }
+                    const float xv = xRow[rowIdx];
+                    if (xv == 0.0f) {
+                        continue;
+                    }
+                    const float* wRow = W.denseResidualWeights.data() + (tile * rowsPerTile + s) * bm;
+                    axpy_inplace_avx2_or_scalar(yTile, wRow, bm, xv);
+                }
+            }
+        }
+    }
+
+    if (!W.i2sResidual.empty()) {
+        const std::size_t tTile = 2;
+        const std::size_t nKBlocks = W.i2sResidual.nKBlocks();
+        thread_local std::vector<int8_t> x8Scratch;
+        thread_local std::vector<float> xScaleScratch;
+        x8Scratch.resize(tTile * W.rows);
+        xScaleScratch.resize(tTile * nKBlocks);
+        linear_forward_bitnet_i2s_accum(
+            Y,
+            X,
+            W.i2sResidual,
+            T,
+            tTile,
+            x8Scratch.data(),
+            xScaleScratch.data());
+    }
+}
+
+void linear_fused_dual_forward_bitnet_tl2_generated(
+    float* __restrict Ya,
+    float* __restrict Yb,
+    const float* __restrict X,
+    const BitNetMatTL2Gen& Wa,
+    const BitNetMatTL2Gen& Wb,
+    std::size_t T)
+{
+    linear_forward_bitnet_tl2_generated(Ya, X, Wa, T);
+    linear_forward_bitnet_tl2_generated(Yb, X, Wb, T);
 }

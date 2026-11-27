@@ -578,6 +578,45 @@ inline void axpy_x4_inplace_avx2_or_scalar(
     }
 }
 
+inline void axpy_bias_x4_inplace_avx2_or_scalar(
+    float* y0,
+    float* y1,
+    float* y2,
+    float* y3,
+    float* yBias,
+    const float* x,
+    std::size_t n,
+    float alpha0,
+    float alpha1,
+    float alpha2,
+    float alpha3)
+{
+    if (!y0 || !y1 || !y2 || !y3 || !yBias || !x) {
+        throw std::runtime_error("axpy_bias_x4_inplace_avx2_or_scalar: null pointer");
+    }
+    const __m256 a0 = _mm256_set1_ps(alpha0);
+    const __m256 a1 = _mm256_set1_ps(alpha1);
+    const __m256 a2 = _mm256_set1_ps(alpha2);
+    const __m256 a3 = _mm256_set1_ps(alpha3);
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 xv = _mm256_loadu_ps(x + i);
+        _mm256_storeu_ps(y0 + i, _mm256_fmadd_ps(a0, xv, _mm256_loadu_ps(y0 + i)));
+        _mm256_storeu_ps(y1 + i, _mm256_fmadd_ps(a1, xv, _mm256_loadu_ps(y1 + i)));
+        _mm256_storeu_ps(y2 + i, _mm256_fmadd_ps(a2, xv, _mm256_loadu_ps(y2 + i)));
+        _mm256_storeu_ps(y3 + i, _mm256_fmadd_ps(a3, xv, _mm256_loadu_ps(y3 + i)));
+        _mm256_storeu_ps(yBias + i, _mm256_add_ps(_mm256_loadu_ps(yBias + i), xv));
+    }
+    for (; i < n; ++i) {
+        const float xv = x[i];
+        y0[i] += alpha0 * xv;
+        y1[i] += alpha1 * xv;
+        y2[i] += alpha2 * xv;
+        y3[i] += alpha3 * xv;
+        yBias[i] += xv;
+    }
+}
+
 inline void copy_avx2_or_scalar(
     float* dst,
     const float* src,

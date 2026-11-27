@@ -1,6 +1,7 @@
 ﻿#pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <span>
@@ -8,6 +9,7 @@
 #include "config.h"          
 #include "paramRef.h"        
 #include "bitnet_weight.h"   
+#include "lora_type.h"
 
 struct ModelShape {
     std::size_t vocabSize;
@@ -62,20 +64,6 @@ struct LayerWeights {
     BitNetMatTL2Gen Wdown_tl2g;
 };
 
-struct LayerLoRA {
-    std::vector<float> Aq;
-    std::vector<float> Bq;
-    std::vector<float> Av;
-    std::vector<float> Bv;
-};
-
-struct LayerLoRAGrads {
-    std::vector<float> gradAq;
-    std::vector<float> gradBq;
-    std::vector<float> gradAv;
-    std::vector<float> gradBv;
-};
-
 class CpuKernelBackend {
 public:
     explicit CpuKernelBackend(TrainerConfig cfg);
@@ -98,35 +86,67 @@ public:
     );
 
     void zeroGrad();
+    void markTrainableParamsUpdated();
     void saveLoRA(const std::string& path) const;
     void loadLoRA(const std::string& path);
     std::vector<ParamRef> collectTrainableParams();
 
 private:
     ModelShape loadShapeFromConfig(const std::string& modelPath);
+    bool ffnLoraLayerEnabled(std::size_t layer) const;
 
     TrainerConfig cfg_;
     ModelShape shape_;
+    std::uint64_t doraParamVersion_ = 0;
+    std::uint64_t doraNormVersion_ = 0;
+    std::uint64_t doraLmHeadNormVersion_ = 0;
 
     std::vector<float> embeddings_;
     std::vector<float> W_out_;
     BitNetMatI2S W_out_q;
+    std::vector<float> ropeCosTable_;
+    std::vector<float> ropeSinTable_;
 
     std::vector<LayerWeights> layers_;
 
     std::vector<LayerLoRA> loras_;
     std::vector<LayerLoRAGrads> loraGrads_;
+    LmHeadLoRA lmHeadLora_;
+    LmHeadLoRAGrads lmHeadLoraGrads_;
+    std::vector<float> lmHeadBias_;
+    std::vector<float> lmHeadBiasGrad_;
+    std::vector<float> finalNormScale_;
+    std::vector<float> finalNormBias_;
+    std::vector<float> finalNormScaleGrad_;
+    std::vector<float> finalNormBiasGrad_;
+    std::vector<float> rmsFinalGrad_;
 
     std::vector<float> tmpQ_cache_;
+    std::vector<float> tmpK_cache_;
     std::vector<float> tmpV_cache_;
+    std::vector<float> tmpO_cache_;
+    std::vector<float> tmpFfnDown_cache_;
+    std::vector<float> tmpFfnGate_cache_;
+    std::vector<float> tmpFfnUp_cache_;
+    std::vector<float> tmpLmHead_cache_;
+    std::vector<float> dTmpLmHead_cache_;
+    std::vector<float> q_dora_prerope_cache_;
+    std::vector<float> k_dora_prerope_cache_;
+    std::vector<float> q_dora_prerope_recompute_;
+    std::vector<float> k_dora_prerope_recompute_;
+    std::vector<float> tmpLmHeadDora_cache_;
+    std::vector<float> dLogitsDoraScratch_;
     std::vector<float> xnorm_cache_;
+    std::vector<float> xnorm_ffn_cache_;
     std::vector<float> q_cache_;
     std::vector<float> k_cache_;
     std::vector<float> v_cache_;
+    std::vector<float> ctx_cache_;
     std::vector<float> probs_cache_;
     std::vector<float> x_mid_cache_;
     std::vector<float> gate_cache_;
     std::vector<float> up_cache_;
+    std::vector<float> ffn_act_cache_;
 
     std::vector<float> x_;
     std::vector<float> xnorm_;
@@ -140,6 +160,11 @@ private:
     std::vector<float> probs_;
 
     std::vector<float> dTmpRank_;
+    std::vector<float> attnLoraGradAqLocal_;
+    std::vector<float> attnLoraGradBqLocal_;
+    std::vector<float> attnLoraGradAvLocal_;
+    std::vector<float> attnLoraGradBvLocal_;
+    std::vector<float> attnLoraTmpRankLocal_;
     std::vector<float> dX_;
     std::vector<float> dAttn_;
     std::vector<float> dCtx_;
@@ -165,7 +190,10 @@ private:
 
     std::vector<float> rms_final_;
     std::vector<float> xnorm_final_;
+    std::vector<float> xnorm_final_base_cache_;
     std::vector<float> dXnorm_final_;
+    std::vector<float> lmHeadDyCompactScratch_;
+    std::vector<float> lmHeadDxCompactScratch_;
 
     std::vector<float> x_ckpt_;
     std::vector<float> tmpdP_;

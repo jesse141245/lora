@@ -236,6 +236,7 @@ Checkpointer::loadLatest(CpuKernelBackend& backend, LionOptimizer& opt) {
         }
     }
 
+    opt.setStep(static_cast<std::uint64_t>(std::max(0, state.step)));
     return state;
 }
 

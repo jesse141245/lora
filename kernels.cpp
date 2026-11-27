@@ -5,6 +5,7 @@
 #include <cmath>
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdlib>
 #include <immintrin.h>
 #include <cstdint>
@@ -63,8 +64,23 @@ static inline int packed_kc_block() {
     return cached;
 }
 
+static inline bool packed_gemm_enabled() {
+    static const bool cached = []() {
+        const auto value = try_get_env_string("QLORA_TEST_PACKED_GEMM");
+        if (!value) {
+            return true;
+        }
+        std::string s = *value;
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return !(s == "0" || s == "false" || s == "off" || s == "no");
+    }();
+    return cached;
+}
+
 static inline bool should_use_packed_gemm(std::size_t M, std::size_t N, std::size_t K) {
-    return M >= 32 && N >= 8 && K >= 128;
+    return packed_gemm_enabled() && M >= 32 && N >= 8 && K >= 128;
 }
 
 static inline std::size_t round_up_tiles(std::size_t value, std::size_t tile) {

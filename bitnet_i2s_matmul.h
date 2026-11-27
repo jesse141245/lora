@@ -131,7 +131,8 @@ void linear_fused_qkv_backward_bitnet_i2s_packed(
     int8_t* __restrict dk8Scratch,
     float* __restrict dkScaleScratch,
     int8_t* __restrict dv8Scratch,
-    float* __restrict dvScaleScratch
+    float* __restrict dvScaleScratch,
+    bool destStartsZero = false
 );
 
 // ------------------------------------------------------------

@@ -60,10 +60,22 @@
     <ClCompile Include="lion_optimizer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="muon_optimizer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="lora.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="lora_io.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="attention.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="backend_runtime_policy_builder.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="backend_runtime_policy_json.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -89,10 +101,25 @@
     <ClInclude Include="lion_optimizer.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="muon_optimizer.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="lora.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="kernels.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="attention.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="backend_runtime_policy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="backend_runtime_policy_builder.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="backend_runtime_policy_json.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="lora_type.h">
